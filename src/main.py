@@ -137,75 +137,152 @@ class MarketMakerBot:
         asyncio.create_task(self._defend_after_trade(actual_price, order_id))
 
     async def _defend_after_trade(self, actual_price: float, order_id: str | None = None):
-        status = self.risk_manager.get_inventory_status()
-        if status == "EMERGENCY":
-            await self._emergency_market_exit()
-            return
+        """체결 후 인벤토리 상태를 점검하고 필요한 방어 조치를 수행합니다."""
+        # 1. 서킷 브레이커 및 비상 상태 체크
+        if self.risk_manager.get_inventory_status() == "EMERGENCY":
+            return await self._emergency_market_exit()
+
+        # 2. 가격 이탈 검증 (Circuit Breaker)
         if order_id and order_id in self.open_orders:
-            order_data = self.open_orders[order_id]
-            if not self.risk_manager.validate_execution_price(float(order_data.get("price", 0)), actual_price):
-                logger.warning("⛔ CIRCUIT_BREAKER_HALT")
+            expected_price = float(self.open_orders[order_id].get("price", 0))
+            if not self.risk_manager.validate_execution_price(expected_price, actual_price):
+                logger.error("circuit_breaker_halted_system", order_id=order_id)
+            self.open_orders.pop(order_id, None) # 체결된 주문 제거
+
+        # 3. 델타 뉴트럴 헤징
         hedge_needed = self.risk_manager.calculate_hedge_need()
-        if abs(hedge_needed) >= 1.0: await self.execute_auto_hedge(hedge_needed)
-        if order_id: self.open_orders.pop(order_id, None)
+        if abs(hedge_needed) >= 1.0: 
+            await self.execute_auto_hedge(hedge_needed)
 
     async def _emergency_market_exit(self):
+        """비상 상황 시 즉시 모든 포지션을 정리하고 시장에서 철수합니다."""
+        logger.critical("🚨 EMERGENCY_EXIT_INITIATED")
+        
+        # 모든 주문 취소와 상태 초기화를 원자적으로 수행
         await self.order_executor.cancel_all_orders(self.settings.market_id)
         self.open_orders.clear()
+        
+        # 공격적인 시장가 헤징으로 포지션 0화
         hedge_needed = self.risk_manager.calculate_hedge_need()
-        if abs(hedge_needed) >= 1.0: await self.execute_auto_hedge(hedge_needed, aggressive=True) 
-
-    async def execute_auto_hedge(self, amount: float, aggressive: bool = False):
-        target_token_id = self.yes_token_id if amount > 0 else self.no_token_id
-        target_book = await self.rest_client.get_orderbook(target_token_id)
-        target_price = 0.99 if aggressive else float(target_book.get("best_ask", 0.99))
-        hedge_order = {"market": self.settings.market_id, "side": "BUY", "size": str(abs(amount)), "price": str(target_price), "token_id": target_token_id}
-        try:
-            await self.order_executor.place_order(hedge_order)
-            logger.info("✅ HEDGE_ORDER_PLACED", price=target_price, size=abs(amount))
-        except Exception as e: logger.error("❌ HEDGE_ORDER_FAILED", error=str(e))                      
+        if abs(hedge_needed) >= 1.0:
+            await self.execute_auto_hedge(hedge_needed, aggressive=True)
 
     async def check_and_defend_orders(self):
-        if not self.current_orderbook: return
-        mid_price = (float(self.current_orderbook.get("best_bid", 0)) + float(self.current_orderbook.get("best_ask", 1))) / 2.0
-        if any(abs(mid_price - float(o.get("price"))) < 0.001 for o in self.open_orders.values()):
-            await self.order_executor.cancel_all_orders(self.settings.market_id)
-            self.open_orders.clear()
-            self.last_quote_time = 0        
+        """실시간 오더북 변화에 따라 주문의 유효성을 검사하고 방어합니다."""
+        if not self.current_orderbook or not getattr(self, 'current_max_spread', None):
+            return
+
+        mid_price = (float(self.current_orderbook.get("best_bid", 0)) + 
+                     float(self.current_orderbook.get("best_ask", 1))) / 2.0
+
+        for order_id, order in list(self.open_orders.items()):
+            price_diff = abs(mid_price - float(order.get("price", 0)))
+            
+            # 방어 트리거 조건 (체결 위험 OR 리워드 실격)
+            is_risky = price_diff < (self.current_max_spread * 0.1)
+            is_invalid = price_diff > self.current_max_spread
+            
+            if is_risky or is_invalid:
+                logger.info("defensive_action_triggered", 
+                            reason="RISKY" if is_risky else "INVALID", 
+                            diff=round(price_diff, 4))
+                await self._reset_local_market_state()
+                break
+
+    async def _reset_local_market_state(self):
+        """현재 마켓의 주문을 모두 취소하고 로컬 상태를 초기화합니다."""
+        await self.order_executor.cancel_all_orders(self.settings.market_id)
+        self.open_orders.clear()
+        self.last_quote_time = 0
+
+    # --- [2. 주문 실행 로직] ---
+
+    async def execute_auto_hedge(self, amount: float, aggressive: bool = False):
+        """불균형한 인벤토리를 맞추기 위한 헤징 주문을 실행합니다."""
+        try:
+            target_token = self.yes_token_id if amount > 0 else self.no_token_id
+            
+            # 가격 결정: 공격적일 경우 0.99(사실상 시장가), 아닐 경우 최우선 매도호가
+            if aggressive:
+                target_price = 0.99
+            else:
+                book = await self.rest_client.get_orderbook(target_token)
+                target_price = float(book.get("best_ask", 0.99))
+
+            hedge_order = {
+                "market": self.settings.market_id,
+                "side": "BUY",
+                "size": str(abs(amount)),
+                "price": str(target_price),
+                "token_id": target_token
+            }
+            
+            await self.order_executor.place_order(hedge_order)
+            logger.info("hedge_order_executed", amount=abs(amount), price=target_price)
+        except Exception as e:
+            logger.error("hedge_execution_failed", error=str(e))
 
     async def refresh_quotes(self, market_info: dict[str, Any]):
-        if (time.time() * 1000 - self.last_quote_time) < self.settings.quote_refresh_rate_ms: return
-        self.last_quote_time = time.time() * 1000
-        if not self.current_orderbook: await self.update_orderbook()
-        yes_quote, no_quote = self.quote_engine.generate_quotes(self.settings.market_id, float(self.current_orderbook.get("best_bid", 0)), float(self.current_orderbook.get("best_ask", 1)), self.yes_token_id, self.no_token_id, market_info.get('max_spread', 0.01), self.settings.min_size)
-        await self._cancel_stale_orders()
-        if yes_quote: await self._place_quote(yes_quote, "YES")
-        if no_quote: await self._place_quote(no_quote, "NO")
+        """최신 호가에 맞춰 주문을 갱신합니다."""
+        # 1. 갱신 주기 확인
+        now_ms = time.time() * 1000
+        if (now_ms - self.last_quote_time) < self.settings.quote_refresh_rate_ms:
+            return
+        
+        self.last_quote_time = now_ms
 
-    async def _cancel_stale_orders(self):
-        try:
-            open_orders = await self.rest_client.get_open_orders(self.order_signer.get_address(), self.settings.market_id)
-            now = time.time() * 1000
-            stale_ids = [o.get("id") for o in open_orders if now - o.get("timestamp", 0) > self.settings.order_lifetime_ms]
-            if stale_ids:
-                await self.order_executor.batch_cancel_orders(stale_ids)
-                for oid in stale_ids: self.open_orders.pop(oid, None)
-        except Exception as e: logger.error("stale_cancel_failed", error=str(e))
+        # 2. 오더북 데이터 확보 및 쿼트 생성
+        if not self.current_orderbook:
+            await self.update_orderbook()
+        
+        best_bid = float(self.current_orderbook.get("best_bid", 0))
+        best_ask = float(self.current_orderbook.get("best_ask", 1))
+        
+        yes_q, no_q = self.quote_engine.generate_quotes(
+            self.settings.market_id, best_bid, best_ask,
+            self.yes_token_id, self.no_token_id,
+            market_info.get('max_spread', 0.01), self.settings.min_size
+        )
+
+        # 3. 기존 만료 주문 정리 및 새 주문 배치
+        await self._cancel_stale_orders()
+        for quote, side in [(yes_q, "YES"), (no_q, "NO")]:
+            if quote:
+                await self._place_quote(quote, side)
 
     async def _place_quote(self, quote: Any, outcome: str):
-        is_valid, _ = self.risk_manager.validate_order(quote.side, quote.size)
-        if not is_valid: return
+        """리스크 검증 후 단일 주문을 시장에 제출합니다."""
+        valid, reason = self.risk_manager.validate_order(quote.side, quote.size)
+        if not valid:
+            logger.debug("quote_rejected_by_risk_manager", reason=reason)
+            return
+
         try:
-            order = {"market": quote.market, "side": quote.side, "size": str(quote.size), "price": str(quote.price), "token_id": quote.token_id}
-            result = await self.order_executor.place_order(order)
-            if result and "id" in result: self.open_orders[result["id"]] = order
-        except Exception as e: logger.error("quote_failed", error=str(e))
+            order_data = {
+                "market": quote.market, "side": quote.side, "size": str(quote.size),
+                "price": str(quote.price), "token_id": quote.token_id
+            }
+            result = await self.order_executor.place_order(order_data)
+            if result and "id" in result:
+                self.open_orders[result["id"]] = order_data
+        except Exception as e:
+            logger.error("quote_placement_failed", outcome=outcome, error=str(e))
+
+    # --- [3. 메인 루프 컨트롤] ---
 
     async def run_cancel_replace_cycle(self, market_info: dict[str, Any]):
+        """봇의 메인 쿼팅 루프를 실행합니다."""
+        logger.info("starting_cancel_replace_cycle")
         while self.running:
-            if not self.risk_manager.is_halted:
-                await self.refresh_quotes(market_info)
-            await asyncio.sleep(self.settings.cancel_replace_interval_ms / 1000.0)
+            try:
+                if not self.risk_manager.is_halted:
+                    await self.refresh_quotes(market_info)
+                
+                interval = self.settings.cancel_replace_interval_ms / 1000.0
+                await asyncio.sleep(interval)
+            except Exception as e:
+                logger.error("loop_cycle_exception", error=str(e))
+                await asyncio.sleep(1) # 에러 시 잠시 대기
 
     async def run_auto_redeem(self):
         while self.running:

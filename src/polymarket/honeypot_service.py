@@ -110,14 +110,18 @@ class HoneypotScanner:
         final_score = score_base * mid_weight * time_weight
 
         return {
+            "market_id": market.get("id"), # 이식 시 식별을 위해 추가
             "title": market.get("question"),
             "score": round(final_score, 4),
             "mid": round(mid, 3),
-            "reward": round(daily_reward, 2),    # 일일 배당금 표시
+            "reward": round(daily_reward, 2),
+            "max_spread": max_v_spread,        # [필수 추가] 1번 및 4번 방어 로직용 데이터
             "min_size": round(min_inc_size, 1),
             "depth": round(existing_depth_usd, 2),
             "hours_left": int(hours_left),
-            "slug": market.get("slug")
+            "slug": market.get("slug"),
+            "yes_token_id": json.loads(market.get("clobTokenIds", "[]"))[0] if market.get("clobTokenIds") else None,
+            "no_token_id": json.loads(market.get("clobTokenIds", "[]"))[1] if market.get("clobTokenIds") else None
         }
 
     async def scan(self):
