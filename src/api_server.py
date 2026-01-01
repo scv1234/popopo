@@ -21,11 +21,14 @@ class OrderRequest(BaseModel):
     shares: float
 
 @app.get("/honey-pots")
-async def get_honey_pots():
-    """수익성과 안전성이 검증된 마켓 리스트를 점수 순으로 반환합니다."""
-    # main.py의 스캔 및 점수화 로직 호출
-    candidates = await bot.get_all_candidates_scored() 
-    return candidates
+def get_honey_pots():
+    conn = sqlite3.connect('bot_data.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT data FROM honeypots')
+    rows = cursor.fetchall()
+    conn.close()
+    
+    return [json.loads(row[0]) for row in rows]
 
 @app.get("/status")
 async def get_status():

@@ -26,6 +26,7 @@ from src.services import AutoRedeem, start_metrics_server
 logging.basicConfig(level=logging.INFO)
 logger = structlog.get_logger(__name__)
 
+#1. 초기화
 
 class MarketMakerBot:
     def __init__(self, settings: Settings):
@@ -52,79 +53,62 @@ class MarketMakerBot:
 
         self.yes_token_id = ""
         self.no_token_id = ""
+    
+    #2. 마켓 탐색
 
-        self._volatility_cache = {}  # 변동성 캐시
-        self._last_discovery_time = 0
-
-    async def get_all_candidates_scored(self) -> list[dict[str, Any]]:
-        """기존의 복잡한 로직을 HoneypotService로 대체합니다."""
-        return await self.honeypot_service.scan_and_score_markets()
-
-    async def execute_manual_safety_order(self, market_id: str, shares: float) -> bool:
-        """대시보드 요청에 따라 특정 마켓에 안전 구역 주문을 실행합니다."""
-        try:
-            market_details = await self.rest_client.get_market(market_id)
-            self.yes_token_id = market_details.get("yes_token_id")
-            self.no_token_id = market_details.get("no_token_id")
-            
-            await self.update_orderbook()
-            best_bid = float(self.current_orderbook.get("best_bid", 0))
-            best_ask = float(self.current_orderbook.get("best_ask", 1))
-
-            yes_quote, no_quote = self.quote_engine.generate_quotes(
-                market_id=market_id,
-                best_bid=best_bid,
-                best_ask=best_ask,
-                yes_token_id=self.yes_token_id,
-                no_token_id=self.no_token_id,
-                max_spread_cents=float(market_details.get("max_incentive_spread", 3.5)),
-                min_size_shares=float(market_details.get("min_incentive_size", 100)),
-                user_input_shares=shares
-            )
-
-            if yes_quote: await self._place_quote(yes_quote, "YES")
-            if no_quote: await self._place_quote(no_quote, "NO")
-            return True
-        except Exception as e:
-            logger.error("manual_order_failed", error=str(e))
-            return False
-
-    async def calculate_volatility(self, market_id: str) -> float:
-        """최근 가격 이력을 가져와 변동성을 계산합니다."""
-        history = await self.rest_client.get_price_history(market_id)
-        if not history: return 1.0
-        prices = [float(p.get("price", 0.5)) for p in history]
-        return max(prices) - min(prices)    
+    async def run_market_discovery_loop(self):
+        """[통합 루프] 10분마다 시장 스캔 및 봇 타겟 자동 전환"""
+        while self.running:
+            try:
+                logger.info("🔎 주기적 시장 스캔 및 꿀통 탐색 시작...")
+                candidates = await self.honeypot_service.scan()
+                
+                if candidates:
+                    best = candidates[0]
+                    if self.settings.market_id != best['market_id']:
+                        logger.info(f"🔄 최적 마켓 발견, 전환합니다: {best['title']}")
+                        await self._reset_local_market_state() # 기존 마켓 주문 취소 및 초기화
+                        
+                        # 설정 업데이트
+                        self.settings.market_id = best['market_id']
+                        self.yes_token_id = best['yes_token_id']
+                        self.no_token_id = best['no_token_id']
+                        self.settings.min_size = best['min_size']
+                        
+                        # 웹소켓 재구독
+                        await self.ws_client.subscribe_orderbook(self.settings.market_id)
+                
+            except Exception as e:
+                logger.error(f"🚨 탐색 루프 에러: {e}")
+            await asyncio.sleep(600)
 
     async def discover_market(self) -> dict[str, Any] | None:
-        """최고 점수 마켓을 찾아 봇의 세팅을 업데이트합니다."""
-        candidates = await self.get_all_candidates_scored()
+        """최고 점수 마켓을 찾아 초기 세팅을 완료합니다."""
+        candidates = await self.honeypot_service.scan()
         if not candidates:
             logger.warning("no_honeypot_found")
             return None
         
         best = candidates[0]
-        # 봇 설정 동기화
         self.settings.market_id = best['market_id']
         self.yes_token_id = best['yes_token_id']
         self.no_token_id = best['no_token_id']
         self.settings.min_size = best['min_size']
         
-        logger.info("honey_pot_activated", market=best['market_name'], score=best['score'])
+        logger.info("honey_pot_activated", market=best['title'], score=best['score'])
         return best
 
     async def update_orderbook(self):
-        try:
-            target_id = self.yes_token_id if self.yes_token_id else self.settings.market_id
-            orderbook = await self.rest_client.get_orderbook(target_id)
-            self.current_orderbook = orderbook
-        except Exception as e:
-            logger.error("orderbook_update_failed", error=str(e))
+        """HoneypotService를 사용하여 오더북 업데이트"""
+        target_token = self.yes_token_id if self.yes_token_id else self.settings.market_id
+        self.current_orderbook = await self.honeypot_service.get_orderbook(target_token)
+
+    #3. 호가창 및 체결 내역 데이터 정리  
 
     def _handle_orderbook_update(self, data: dict[str, Any]):
         if data.get("market") == self.settings.market_id:
             self.current_orderbook = data.get("book", self.current_orderbook)
-            asyncio.create_task(self.check_and_defend_orders())
+            asyncio.create_task(self.check_and_defend_orders())     
             
     def _handle_trade_update(self, data: dict[str, Any]):
         side, size, token_id = data.get("side"), float(data.get("size", 0)), data.get("token_id")
@@ -135,6 +119,8 @@ class MarketMakerBot:
         
         self.inventory_manager.update_inventory(yes_delta, no_delta)
         asyncio.create_task(self._defend_after_trade(actual_price, order_id))
+
+    #4. 리스크 관리  
 
     async def _defend_after_trade(self, actual_price: float, order_id: str | None = None):
         """체결 후 인벤토리 상태를 점검하고 필요한 방어 조치를 수행합니다."""
@@ -195,67 +181,52 @@ class MarketMakerBot:
         self.open_orders.clear()
         self.last_quote_time = 0
 
-    # --- [2. 주문 실행 로직] ---
+    #5. 주문 생성 및 실행   
 
     async def execute_auto_hedge(self, amount: float, aggressive: bool = False):
-        """불균형한 인벤토리를 맞추기 위한 헤징 주문을 실행합니다."""
+        """인벤토리 불균형 해소를 위한 헤징 주문"""
         try:
             target_token = self.yes_token_id if amount > 0 else self.no_token_id
-            
-            # 가격 결정: 공격적일 경우 0.99(사실상 시장가), 아닐 경우 최우선 매도호가
             if aggressive:
                 target_price = 0.99
             else:
-                book = await self.rest_client.get_orderbook(target_token)
+                book = await self.honeypot_service.get_orderbook(target_token)
                 target_price = float(book.get("best_ask", 0.99))
 
             hedge_order = {
-                "market": self.settings.market_id,
-                "side": "BUY",
-                "size": str(abs(amount)),
-                "price": str(target_price),
-                "token_id": target_token
+                "market": self.settings.market_id, "side": "BUY", "size": str(abs(amount)),
+                "price": str(target_price), "token_id": target_token
             }
-            
             await self.order_executor.place_order(hedge_order)
-            logger.info("hedge_order_executed", amount=abs(amount), price=target_price)
         except Exception as e:
-            logger.error("hedge_execution_failed", error=str(e))
+            logger.error("hedge_failed", error=str(e))
 
     async def refresh_quotes(self, market_info: dict[str, Any]):
-        """최신 호가에 맞춰 주문을 갱신합니다."""
-        # 1. 갱신 주기 확인
+        """최신 가격에 맞춰 MM 주문 갱신"""
         now_ms = time.time() * 1000
         if (now_ms - self.last_quote_time) < self.settings.quote_refresh_rate_ms:
             return
-        
         self.last_quote_time = now_ms
 
-        # 2. 오더북 데이터 확보 및 쿼트 생성
-        if not self.current_orderbook:
-            await self.update_orderbook()
+        if not self.current_orderbook: await self.update_orderbook()
         
-        best_bid = float(self.current_orderbook.get("best_bid", 0))
-        best_ask = float(self.current_orderbook.get("best_ask", 1))
+        self.current_max_spread = market_info.get('max_spread', 0.035) # 리스크 체크용 저장
         
         yes_q, no_q = self.quote_engine.generate_quotes(
-            self.settings.market_id, best_bid, best_ask,
+            self.settings.market_id, float(self.current_orderbook.get("best_bid", 0)),
+            float(self.current_orderbook.get("best_ask", 1)),
             self.yes_token_id, self.no_token_id,
-            market_info.get('max_spread', 0.01), self.settings.min_size
+            self.current_max_spread, self.settings.min_size
         )
 
-        # 3. 기존 만료 주문 정리 및 새 주문 배치
         await self._cancel_stale_orders()
         for quote, side in [(yes_q, "YES"), (no_q, "NO")]:
-            if quote:
-                await self._place_quote(quote, side)
+            if quote: await self._place_quote(quote, side)
 
     async def _place_quote(self, quote: Any, outcome: str):
-        """리스크 검증 후 단일 주문을 시장에 제출합니다."""
+        """리스크 매니저 승인 후 주문 제출"""
         valid, reason = self.risk_manager.validate_order(quote.side, quote.size)
-        if not valid:
-            logger.debug("quote_rejected_by_risk_manager", reason=reason)
-            return
+        if not valid: return
 
         try:
             order_data = {
@@ -263,55 +234,94 @@ class MarketMakerBot:
                 "price": str(quote.price), "token_id": quote.token_id
             }
             result = await self.order_executor.place_order(order_data)
-            if result and "id" in result:
-                self.open_orders[result["id"]] = order_data
+            if result and "id" in result: self.open_orders[result["id"]] = order_data
         except Exception as e:
-            logger.error("quote_placement_failed", outcome=outcome, error=str(e))
+            logger.error("placement_failed", error=str(e))
 
-    # --- [3. 메인 루프 컨트롤] ---
+    async def _cancel_stale_orders(self):
+        if self.open_orders:
+            await self.order_executor.cancel_all_orders(self.settings.market_id)
+            self.open_orders.clear()
 
-    async def run_cancel_replace_cycle(self, market_info: dict[str, Any]):
-        """봇의 메인 쿼팅 루프를 실행합니다."""
-        logger.info("starting_cancel_replace_cycle")
-        while self.running:
-            try:
-                if not self.risk_manager.is_halted:
-                    await self.refresh_quotes(market_info)
-                
-                interval = self.settings.cancel_replace_interval_ms / 1000.0
-                await asyncio.sleep(interval)
-            except Exception as e:
-                logger.error("loop_cycle_exception", error=str(e))
-                await asyncio.sleep(1) # 에러 시 잠시 대기
+    async def execute_manual_safety_order(self, market_id: str, shares: float) -> bool:
+        """대시보드 수동 주문 로직 (HoneypotService 연동)"""
+        try:
+            market_details = await self.honeypot_service.get_market(market_id)
+            token_ids = json.loads(market_details.get("clobTokenIds", "[]"))
+            y_id, n_id = token_ids[0], token_ids[1]
+            
+            orderbook = await self.honeypot_service.get_orderbook(y_id)
+            
+            yes_quote, no_quote = self.quote_engine.generate_quotes(
+                market_id=market_id,
+                best_bid=float(orderbook.get("best_bid", 0)),
+                best_ask=float(orderbook.get("best_ask", 1)),
+                yes_token_id=y_id, no_token_id=n_id,
+                max_spread_cents=float(market_details.get("rewards_max_spread", 3.5)),
+                min_size_shares=float(market_details.get("rewards_min_size", 100)),
+                user_input_shares=shares
+            )
+            if yes_quote: await self._place_quote(yes_quote, "YES")
+            if no_quote: await self._place_quote(no_quote, "NO")
+            return True
+        except Exception as e:
+            logger.error("manual_order_failed", error=str(e))
+            return False
 
     async def run_auto_redeem(self):
         while self.running:
             if self.settings.auto_redeem_enabled: await self.auto_redeem.auto_redeem_all(self.order_signer.get_address())
-            await asyncio.sleep(300)
+            await asyncio.sleep(300)        
+
+    #6. 메인루프
 
     async def run(self):
         self.running = True
         market_info = await self.discover_market()
         if not market_info: return
+
         self.ws_client.register_handler("l2_book", self._handle_orderbook_update)
         self.ws_client.register_handler("user", self._handle_trade_update)
+        
         await self.update_orderbook()
+        
         if self.settings.market_discovery_enabled:
             await self.ws_client.connect()
             await self.ws_client.subscribe_orderbook(self.settings.market_id)
             await self.ws_client.subscribe_user(self.order_signer.get_address())
-        tasks = [self.run_cancel_replace_cycle(market_info), self.run_auto_redeem()]
+
+        # 모든 루프를 병렬 실행
+        tasks = [
+            asyncio.create_task(self.run_market_discovery_loop()),
+            asyncio.create_task(self.run_cancel_replace_cycle(market_info)),
+            asyncio.create_task(self.run_auto_redeem())
+        ]
         if self.ws_client.running: tasks.append(self.ws_client.listen())
-        try: await asyncio.gather(*tasks)
-        finally: await self.cleanup()
+        
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            await self.cleanup()
+
+    async def run_cancel_replace_cycle(self, market_info: dict[str, Any]):
+        while self.running:
+            try:
+                if not self.risk_manager.is_halted:
+                    await self.refresh_quotes(market_info)
+                await asyncio.sleep(self.settings.cancel_replace_interval_ms / 1000.0)
+            except Exception as e:
+                logger.error("loop_error", error=str(e))
+                await asyncio.sleep(1)
 
     async def cleanup(self):
         self.running = False
         await self.order_executor.cancel_all_orders(self.settings.market_id)
-        await self.rest_client.close()
+        await self.honeypot_service.close()
         await self.ws_client.close()
         await self.order_executor.close()
         await self.auto_redeem.close()
+
+#7. 부트스트랩
 
 async def bootstrap(settings: Settings):
     load_dotenv()
@@ -328,9 +338,6 @@ async def bootstrap(settings: Settings):
         except NotImplementedError: pass
     try: await bot.run()
     finally: logger.info("bot_shutdown")
-
-def main():
-    asyncio.run(bootstrap(get_settings()))
 
 if __name__ == "__main__":
     main()
