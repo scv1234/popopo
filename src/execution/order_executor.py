@@ -20,6 +20,18 @@ class OrderExecutor:
         self.client = httpx.AsyncClient(timeout=30.0)
         self.pending_cancellations: set[str] = set()
 
+    def _get_auth_headers(self) -> dict:
+        """[추가] 폴리마켓 CLOB 인증 헤더 생성"""
+        key = self.settings.polymarket_builder_api_key
+        if not key:
+            logger.error("❌ API_KEY_IS_EMPTY: .env 파일을 확인하세요.")
+        return {
+            "POLY-API-KEY": self.settings.polymarket_builder_api_key,
+            "POLY-API-SECRET": self.settings.polymarket_builder_secret,
+            "POLY-API-PASSPHRASE": self.settings.polymarket_builder_passphrase,
+            "Content-Type": "application/json"
+        }    
+
     def _format_order(self, order: dict[str, Any]) -> dict[str, Any]:
         """
         Polymarket CLOB 규격에 맞게 가격과 수량을 포맷팅합니다.
@@ -49,7 +61,7 @@ class OrderExecutor:
             response = await self.client.post(
                 f"{self.settings.polymarket_api_url}/order",
                 json=order,
-                headers={"Content-Type": "application/json"},
+                headers=self._get_auth_headers(), # 인증 헤더 적용
             )
             response.raise_for_status()
             
@@ -75,6 +87,7 @@ class OrderExecutor:
             
             response = await self.client.delete(
                 f"{self.settings.polymarket_api_url}/order/{order_id}",
+                headers=self._get_auth_headers() # 인증 헤더 적용
             )
             response.raise_for_status()
             
@@ -94,6 +107,7 @@ class OrderExecutor:
             response = await self.client.delete(
                 f"{self.settings.polymarket_api_url}/orders",
                 params={"market": market_id},
+                headers = self._get_auth_headers()
             )
             response.raise_for_status()
             
@@ -120,6 +134,7 @@ class OrderExecutor:
             response = await self.client.post(
                 f"{self.settings.polymarket_api_url}/orders/cancel",
                 json={"orderIds": order_ids},
+                headers=self._get_auth_headers() # 인증 헤더 적용
             )
             response.raise_for_status()
             

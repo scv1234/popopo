@@ -17,14 +17,27 @@ class Settings(BaseSettings):
     private_key: str = Field(description="Ethereum private key for signing orders")
     public_address: str = Field(description="Ethereum public address")
     rpc_url: str = Field(default="https://polygon-rpc.com")
+
+    polymarket_builder_api_key: str = Field(default="")
+    polymarket_builder_secret: str = Field(default="")
+    polymarket_builder_passphrase: str = Field(default="")
     
     # --- 2. Market Configuration & Discovery (Honey Pot) ---
     market_id: str = Field(default="", description="현재 트레이딩 중인 마켓 ID")
     market_discovery_enabled: bool = Field(default=True, description="꿀통 마켓 자동 탐색 활성화")
-    min_daily_reward_usd: float = Field(default=50.0, description="최소 일일 보상액 필터")
-    max_volatility_threshold: float = Field(default=0.02, description="허용 최대 가격 변동폭 (2센트)")
-    spread_weight: float = Field(default=2.0, description="스프레드 크기 가중치")
-    min_size: float = Field(default=0.0, description="마켓별 최소 리워드 수량(Shares)")
+    
+    # [수정] 서비스 로직에 맞게 50.0 -> 5.0~10.0으로 하향 조정
+    min_daily_reward_usd: float = Field(default=10.0, description="최소 일일 보상액 필터")
+    
+    # [추가] 유동성 상한선도 설정 파일에서 관리
+    max_existing_depth_usd: float = Field(default=100000.0, description="허용 최대 경쟁 유동성")
+    
+    # [수정] 변동성 기준 (센트 단위가 아닌 비율로 관리하는 것이 더 정확함)
+    max_volatility_threshold: float = Field(default=0.05, description="허용 최대 가격 변동폭 (5%)")
+    
+    # [추가] 중간 가격 필터링 범위
+    min_mid_price: float = Field(default=0.15)
+    max_mid_price: float = Field(default=0.85)
 
     # --- 3. Quoting & Execution ---
     default_size: float = Field(default=100.0, description="기본 주문 수량 (Shares)")

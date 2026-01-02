@@ -51,7 +51,7 @@ class MarketMakerBot:
         self.open_orders: dict[str, dict[str, Any]] = {}
         self.last_quote_time = 0.0
 
-        self.current_max_spread = 0.0
+        self.current_spread_cents = 3
 
         self.yes_token_id = ""
         self.no_token_id = ""
@@ -76,6 +76,7 @@ class MarketMakerBot:
                         self.yes_token_id = best['yes_token_id']
                         self.no_token_id = best['no_token_id']
                         self.settings.min_size = best['min_size']
+                        self.spread_cents = best.get('spread_cents', 3) # 단위 통일
                         
                         # 웹소켓 재구독
                         await self.ws_client.subscribe_orderbook(self.settings.market_id)
@@ -103,7 +104,8 @@ class MarketMakerBot:
     async def update_orderbook(self):
         """HoneypotService를 사용하여 오더북 업데이트"""
         target_token = self.yes_token_id if self.yes_token_id else self.settings.market_id
-        self.current_orderbook = await self.honeypot_service.get_orderbook(target_token)
+        session = await self.honeypot_service.get_session()
+        self.current_orderbook = await self.honeypot_service.get_orderbook(session, target_token)
 
     #3. 호가창 및 체결 내역 데이터 정리  
 
@@ -157,23 +159,25 @@ class MarketMakerBot:
 
     async def check_and_defend_orders(self):
         """실시간 오더북 변화에 따라 주문의 유효성을 검사하고 방어합니다."""
-        if not self.current_orderbook or not getattr(self, 'current_max_spread', None):
-            return
+        if not self.current_orderbook: return
+
+        spread_usd = self.current_spread_cents / 100.0
 
         mid_price = (float(self.current_orderbook.get("best_bid", 0)) + 
-                     float(self.current_orderbook.get("best_ask", 1))) / 2.0
+                     float(self.current_orderbook.get("best_ask", 1))) / 2.0           
 
         for order_id, order in list(self.open_orders.items()):
             price_diff = abs(mid_price - float(order.get("price", 0)))
             
             # 방어 트리거 조건 (체결 위험 OR 리워드 실격)
-            is_risky = price_diff < (self.current_max_spread * 0.1)
-            is_invalid = price_diff > self.current_max_spread
+            is_risky = price_diff < (spread_usd * 0.1) # 10% 지점 이내면 위험
+            is_invalid = price_diff > spread_usd     # 범위를 벗어나면 실격
             
             if is_risky or is_invalid:
                 logger.info("defensive_action_triggered", 
                             reason="RISKY" if is_risky else "INVALID", 
-                            diff=round(price_diff, 4))
+                            diff=round(price_diff, 4),
+                            limit_usd=round(spread_usd, 4))
                 await self._reset_local_market_state()
                 break
 
@@ -212,13 +216,16 @@ class MarketMakerBot:
 
         if not self.current_orderbook: await self.update_orderbook()
         
-        self.current_max_spread = market_info.get('max_spread', 0.035) # 리스크 체크용 저장
+        self.spread_cents = market_info.get('spread_cents', 3)
         
         yes_q, no_q = self.quote_engine.generate_quotes(
-            self.settings.market_id, float(self.current_orderbook.get("best_bid", 0)),
+            self.settings.market_id, 
+            float(self.current_orderbook.get("best_bid", 0)),
             float(self.current_orderbook.get("best_ask", 1)),
-            self.yes_token_id, self.no_token_id,
-            self.current_max_spread, self.settings.min_size
+            self.yes_token_id, 
+            self.no_token_id,
+            self.spread_cents, # 정수형 센트 전달
+            self.settings.min_size
         )
 
         await self._cancel_stale_orders()
@@ -246,26 +253,69 @@ class MarketMakerBot:
             self.open_orders.clear()
 
     async def execute_manual_safety_order(self, market_id: str, shares: float) -> bool:
-        """대시보드 수동 주문 로직 (HoneypotService 연동)"""
+        """
+        대시보드 수동 주문 로직: 
+        투자 금액($)을 입력받아 YES/NO 양방향에 안전 유동성을 공급합니다.
+        """
         try:
-            market_details = await self.honeypot_service.get_market(market_id)
-            token_ids = json.loads(market_details.get("clobTokenIds", "[]"))
-            y_id, n_id = token_ids[0], token_ids[1]
+            # 1. 세션 및 마켓 기본 정보(Gamma) 가져오기
+            session = await self.honeypot_service.get_session()
+            market_details = await self.honeypot_service.get_market(session, market_id)
             
-            orderbook = await self.honeypot_service.get_orderbook(y_id)
+            condition_id = market_details.get("conditionId")
+            clob_token_ids = json.loads(market_details.get("clobTokenIds", "[]"))
             
+            if not condition_id or len(clob_token_ids) < 2:
+                logger.error("invalid_market_data", market_id=market_id)
+                return False
+
+            y_id, n_id = clob_token_ids[0], clob_token_ids[1]
+
+            # 2. 리워드 설정 및 오더북 정보 병렬 조회
+            tasks = [
+                session.get(f"{self.honeypot_service.CLOB_API}/rewards/markets/{condition_id}"),
+                self.honeypot_service.get_orderbook(session, y_id)
+            ]
+            responses = await asyncio.gather(*tasks)
+            
+            reward_res = responses[0]
+            orderbook = responses[1]
+
+            # 3. 리워드 파라미터 추출
+            reward_data = {}
+            if reward_res.status == 200:
+                reward_json = await reward_res.json()
+                if reward_json.get("data"):
+                    reward_data = reward_json["data"][0]
+
+            local_spread_cents = int(float(reward_data.get("rewards_max_spread", 3)))
+            min_size = float(reward_data.get("rewards_min_size", 20))
+
+            # 4. 투자 금액($)을 수량(Shares)으로 매핑
+            # 델타 뉴트럴 전략에서 $1000 투자는 YES 1000주 + NO 1000주 공급을 의미합니다.
+            target_shares = shares 
+
+            # 5. QuoteEngine을 통한 안전 호가 생성
             yes_quote, no_quote = self.quote_engine.generate_quotes(
                 market_id=market_id,
                 best_bid=float(orderbook.get("best_bid", 0)),
                 best_ask=float(orderbook.get("best_ask", 1)),
-                yes_token_id=y_id, no_token_id=n_id,
-                max_spread_cents=float(market_details.get("rewards_max_spread", 3.5)),
-                min_size_shares=float(market_details.get("rewards_min_size", 100)),
+                yes_token_id=y_id, 
+                no_token_id=n_id,
+                spread_cents=local_spread_cents,
+                min_size_shares=min_size,
                 user_input_shares=shares
             )
-            if yes_quote: await self._place_quote(yes_quote, "YES")
-            if no_quote: await self._place_quote(no_quote, "NO")
+
+            # 6. 최종 주문 실행
+            if yes_quote: 
+                await self._place_quote(yes_quote, "YES")
+            if no_quote: 
+                await self._place_quote(no_quote, "NO")
+
+            logger.info("manual_safety_order_executed", market=market_id, amount=amount_usd)
             return True
+
         except Exception as e:
             logger.error("manual_order_failed", error=str(e))
             return False
@@ -317,7 +367,8 @@ class MarketMakerBot:
 
     async def cleanup(self):
         self.running = False
-        await self.order_executor.cancel_all_orders(self.settings.market_id)
+        if self.settings.market_id:
+            await self.order_executor.cancel_all_orders(self.settings.market_id)
         await self.honeypot_service.close()
         await self.ws_client.close()
         await self.order_executor.close()

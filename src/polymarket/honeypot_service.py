@@ -13,10 +13,10 @@ logger = logging.getLogger(__name__)
 class HoneypotService:
     def __init__(self, settings=None):
         self.params = {
-            "min_daily_reward_usd": 10,          # [수정] 하루 배당금이 최소 50달러 이상인 시장만!
-            "max_existing_depth_usd": 100000,
-            "min_mid_price": 0.15,
-            "max_mid_price": 0.85,
+            "min_daily_reward_usd": settings.min_daily_reward_usd if settings else 10,
+            "max_existing_depth_usd": getattr(settings, 'max_existing_depth_usd', 100000),
+            "min_mid_price": getattr(settings, 'min_mid_price', 0.15),
+            "max_mid_price": getattr(settings, 'max_mid_price', 0.85),
             "max_order_size_shares": 500,
             "avoid_near_expiry_hours": 10,
             "max_concurrent": 40,
@@ -151,7 +151,7 @@ class HoneypotService:
         # 최고가 - 최저가 = 24시간 가격 변동폭
         return max(prices) - min(prices)    
 
-    def _get_effective_depth(self, book_data, max_v_spread):
+    def _get_effective_depth(self, book_data, spread_usd):
         
         bids = book_data.get("bids", [])
         asks = book_data.get("asks", [])
@@ -168,8 +168,8 @@ class HoneypotService:
         mid_price = (best_bid + best_ask) / 2
 
         # Polymarket 리워드 기준: Mid * (1 ± spread)
-        lower_bound = mid_price - max_v_spread 
-        upper_bound = mid_price + max_v_spread
+        lower_bound = mid_price - spread_usd 
+        upper_bound = mid_price + spread_usd
 
         effective_depth_usd = 0.0
 
@@ -199,16 +199,17 @@ class HoneypotService:
         daily_reward = float(rewards_config[0].get("rate_per_day", 0))
         min_inc_size = float(reward_info.get("rewards_min_size", 0))
         raw_spread = float(reward_info.get("rewards_max_spread", 0))
-        max_v_spread = int(raw_spread)
+        spread_cents = int(raw_spread)
+        spread_usd = spread_cents / 100
 
         # YES 유동성 및 중간가 계산
-        depth_yes, mid_yes = self._get_effective_depth(book, max_v_spread)
+        depth_yes, mid_yes = self._get_effective_depth(book, spread_usd)
         
         # [추가] NO 유동성 계산
         depth_no = 0
-        mid_no = 0.5
+        
         if book_no:
-            depth_no, mid_no = self._get_effective_depth(book_no, max_v_spread)
+            depth_no, mid_no = self._get_effective_depth(book_no, spread_usd)
 
         total_depth = depth_yes + depth_no
 
@@ -254,7 +255,7 @@ class HoneypotService:
             "mid_yes": round(mid_yes, 3),
             "mid_no": round(mid_no, 3),
             "reward": round(daily_reward, 2),
-            "max_spread": round(max_v_spread, 4), # [추가] 보상 스프레드 범위
+            "spread_cents": spread_cents, # [추가] 보상 스프레드 범위
             "depth_yes": round(depth_yes, 2),
             "depth_no": round(depth_no, 2),
             "total_depth": round(total_depth, 2),

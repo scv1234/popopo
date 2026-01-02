@@ -43,7 +43,7 @@ class QuoteEngine:
         best_ask: float, 
         yes_token_id: str, 
         no_token_id: str, 
-        max_spread_cents: float,
+        spread_cents: float,
         min_size_shares: float,
         user_input_shares: float = None,  # <--- 이 매개변수를 추가하세요
     ) -> tuple[Quote | None, Quote | None]:
@@ -61,12 +61,12 @@ class QuoteEngine:
 
         # 2. 안전 마진 계산 (보상 범위의 90% 지점)
         # 예: max_spread가 3c(0.03)라면, 중간가에서 2.7c(0.027) 떨어진 곳에 주문 배치
-        safety_margin = max_spread_cents * 0.9
+        margin_usd = spread_cents * 0.9 / 100
         
         # 3. YES 및 NO 토큰의 매수 가격 결정
         # YES 매수가는 중간가보다 낮게, NO 매수가는 (YES 매도가의 반대이므로) 중간가보다 높게 설정
-        bid_price = round(mid_price - safety_margin, 3)
-        ask_price = round(mid_price + safety_margin, 3) # YES를 이 가격에 팔겠다는 의미
+        bid_price = round(mid_price - margin_usd, 3)
+        ask_price = round(mid_price + margin_usd, 3) # YES를 이 가격에 팔겠다는 의미
         
         # NO 토큰의 매수 가격은 (1 - YES 매도가)와 같음
         no_bid_price = round(1.0 - ask_price, 3)
