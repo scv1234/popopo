@@ -51,6 +51,8 @@ class MarketMakerBot:
         self.open_orders: dict[str, dict[str, Any]] = {}
         self.last_quote_time = 0.0
 
+        self.current_max_spread = 0.0
+
         self.yes_token_id = ""
         self.no_token_id = ""
     
@@ -340,4 +342,9 @@ async def bootstrap(settings: Settings):
     finally: logger.info("bot_shutdown")
 
 if __name__ == "__main__":
-    main()
+    # [수정] main() 대신 asyncio.run과 bootstrap 호출
+    settings = get_settings()
+    try:
+        asyncio.run(bootstrap(settings))
+    except KeyboardInterrupt:
+        pass

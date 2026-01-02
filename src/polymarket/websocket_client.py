@@ -56,6 +56,11 @@ class PolymarketWebSocketClient:
         await self.websocket.send(json.dumps(message))
         logger.info("trades_subscribed", market_id=market_id)
 
+    async def subscribe_user(self, user_address: str):
+        if not self.websocket: await self.connect()
+        message = {"type": "subscribe", "channel": "user", "user": user_address}
+        await self.websocket.send(json.dumps(message))    
+
     async def listen(self):
         if not self.websocket:
             await self.connect()

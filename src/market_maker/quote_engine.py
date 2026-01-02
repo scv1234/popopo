@@ -61,7 +61,7 @@ class QuoteEngine:
 
         # 2. 안전 마진 계산 (보상 범위의 90% 지점)
         # 예: max_spread가 3c(0.03)라면, 중간가에서 2.7c(0.027) 떨어진 곳에 주문 배치
-        safety_margin = (max_spread_cents / 100.0) * 0.9
+        safety_margin = max_spread_cents * 0.9
         
         # 3. YES 및 NO 토큰의 매수 가격 결정
         # YES 매수가는 중간가보다 낮게, NO 매수가는 (YES 매도가의 반대이므로) 중간가보다 높게 설정
@@ -73,7 +73,7 @@ class QuoteEngine:
         
         # 2. 수량 결정 로직 (사용자 입력 우선)
         # 사용자가 입력한 수량을 사용하되, 실수 방지를 위해 min_size보다는 크게 잡습니다.
-        final_shares = max(user_input_shares, min_size_shares)
+        final_shares = max(size, min_size_shares)
         
         if user_input_shares < min_size_shares:
             logger.warning("user_input_below_min_shares", 
