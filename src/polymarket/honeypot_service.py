@@ -3,6 +3,7 @@ import aiohttp
 import sqlite3
 import json
 import logging
+import math
 import time  # <--- 이 줄을 반드시 추가하세요!
 import pandas as pd
 from datetime import datetime, timezone
@@ -14,10 +15,10 @@ class HoneypotService:
     def __init__(self, settings=None):
         self.params = {
             "min_daily_reward_usd": settings.min_daily_reward_usd if settings else 10,
-            "max_existing_depth_usd": getattr(settings, 'max_existing_depth_usd', 100000),
+            "max_existing_depth_usd": getattr(settings, 'max_existing_depth_usd', 5000),
             "min_mid_price": getattr(settings, 'min_mid_price', 0.15),
             "max_mid_price": getattr(settings, 'max_mid_price', 0.85),
-            "max_order_size_shares": 500,
+            "max_order_size_shares": 200,
             "avoid_near_expiry_hours": 10,
             "max_concurrent": 40,
             "limit": 500,
@@ -159,11 +160,15 @@ class HoneypotService:
         if not bids or not asks:
             return 0, 0.5
 
-        # 1. 미드 가격 계산
-        # 매수 호가(bids) 중 가장 높은 가격이 Best Bid
-        best_bid = max(float(b['price']) for b in bids)
-        # 매도 호가(asks) 중 가장 낮은 가격이 Best Ask
-        best_ask = min(float(a['price']) for a in asks)
+        # 매수(Bids): 비싼 가격 -> 싼 가격 (내림차순)
+        # 매수(Bids): 비싼 가격 -> 싼 가격 (내림차순)
+        bids.sort(key=lambda x: float(x['price']), reverse=True)
+        # 매도(Asks): 싼 가격 -> 비싼 가격 (오름차순)
+        asks.sort(key=lambda x: float(x['price']))
+
+        # 1. 미드 가격 계산 (정렬 후에는 0번째 인덱스가 Best Price)
+        best_bid = float(bids[0]['price'])
+        best_ask = float(asks[0]['price'])
     
         mid_price = (best_bid + best_ask) / 2
 
@@ -195,61 +200,72 @@ class HoneypotService:
         now = datetime.now(timezone.utc)
         
         # 1. 보상 데이터 추출
-        rewards_config = reward_info.get("rewards_config", [{}])
-        daily_reward = float(rewards_config[0].get("rate_per_day", 0))
-        min_inc_size = float(reward_info.get("rewards_min_size", 0))
-        raw_spread = float(reward_info.get("rewards_max_spread", 0))
+        daily_reward = float(reward_info.get("rewards_daily_rate") or 0)
+        if daily_reward == 0:
+            configs = reward_info.get("rewards_config", [{}])
+            daily_reward = float(configs[0].get("rate_per_day") or 0)
+            
+        raw_spread = float(reward_info.get("rewards_max_spread", 3))
         spread_cents = int(raw_spread)
-        spread_usd = spread_cents / 100
+        spread_usd = spread_cents / 100.0
+        min_size = float(reward_info.get("rewards_min_size", 20))
+
+        # [추가] 🚨 스프레드 안전 장치: 시장 스프레드가 리워드 범위의 절반을 넘으면 위험
+        b_yes = sorted(book.get("bids", []), key=lambda x: float(x['price']), reverse=True)
+        a_yes = sorted(book.get("asks", []), key=lambda x: float(x['price']))
+        
+        if not b_yes or not a_yes:
+            return None
+            
+        market_spread = float(a_yes[0]['price']) - float(b_yes[0]['price'])
+        if market_spread > (spread_usd * 2):
+            return None
 
         # YES 유동성 및 중간가 계산
         depth_yes, mid_yes = self._get_effective_depth(book, spread_usd)
-        
-        # [추가] NO 유동성 계산
-        depth_no = 0
-        
-        if book_no:
-            depth_no, mid_no = self._get_effective_depth(book_no, spread_usd)
-
+        depth_no, mid_no = (self._get_effective_depth(book_no, spread_usd) if book_no else (0, 0.5))
         total_depth = depth_yes + depth_no
 
         # --- [필터링 로직] ---
         if daily_reward < self.params["min_daily_reward_usd"]: return None
         
         # [수정] 위에서 받아온 정확한 mid 가격으로 필터링 진행
-        if mid_yes < self.params["min_mid_price"] or mid_yes > self.params["max_mid_price"]: 
-            return None
+        if not (self.params["min_mid_price"] <= mid_yes <= self.params["max_mid_price"]): return None
 
-        if min_inc_size > self.params["max_order_size_shares"]: 
-            return None
+        if min_size > self.params["max_order_size_shares"]: return None
 
         # 필터 4: 실효 경쟁자가 너무 많으면 제외
         if total_depth > self.params["max_existing_depth_usd"]: 
             return None
 
-        # 4. 가성비 점수 (Yield Score): $1,000 투입 시 기대 수익 시뮬레이션
-        score_base = (daily_reward / max(total_depth, 50)) * 1000
+        # (1) Base Yield: $1,000 투입 시 지분 대비 수익 (최소 분모 $1,000 설정)
+        yield_score = (daily_reward / max(total_depth, 1000)) * 1000
 
-        # 1. 위치 가중치: 0.5에 가까울수록 보너스
-        mid_weight = 1 + (1 - abs(mid_yes - 0.5)) * 0.1
-    
-        # 2. [정교화] 상대적 변동성 페널티: 가격 대비 변동 비율(%)을 고려
-        rel_vol = (volatility / mid_yes) if mid_yes > 0 else volatility
-        volatility_penalty = 1 + (rel_vol * 15) # 페널티 계수 강화 (10 -> 15)
-        
-        # 3. 시간 가중치
+        # (2) Price Safety: 0.5(50:50) 근처일 때 가장 안전 (가우시안 정규분포)
+        dist_from_mid = abs(mid_yes - 0.5)
+        # sigma=0.15: 0.5일 때 1.0, 0.7 or 0.3일 때 약 0.4
+        price_safety = math.exp(- (dist_from_mid ** 2) / (2 * (0.15 ** 2)))
+
+        # (3) Volatility Safety: 변동성이 작을수록 안전 (역수 감쇠)
+        vol_safety = 1 / (1 + (volatility * 50))
+
+        # (4) Time & Liquidity: 시간 및 탈출 가능성 가중치
         try:
             end_time = datetime.fromisoformat(market.get('endDate').replace("Z", "+00:00"))
             hours_left = (end_time - now).total_seconds() / 3600
             if hours_left < self.params["avoid_near_expiry_hours"]: return None
-            time_weight = 1 + min(hours_left / 1000, 0.2)
-        except: return None
-        
-        # 최종 점수 산산
-        final_score = (score_base * mid_weight * time_weight) / volatility_penalty
+            time_score = 1 + (math.log10(hours_left + 1) * 0.1) 
+        except:
+            time_score = 1.0
+
+        # 🏆 최종 점수 합산
+        final_score = yield_score * price_safety * vol_safety * time_score * 10
+
+        clob_token_ids = market.get("clobTokenIds")
+        token_ids = json.loads(clob_token_ids) if isinstance(clob_token_ids, str) else clob_token_ids
 
         return {
-            "market_id": market.get("id"),
+            "market_id": market.get("conditionId"),
             "title": market.get("question"),
             "score": round(final_score, 4),
             "mid_yes": round(mid_yes, 3),
@@ -260,11 +276,15 @@ class HoneypotService:
             "depth_no": round(depth_no, 2),
             "total_depth": round(total_depth, 2),
             "volatility": round(volatility, 4),
-            "rel_vol": round(rel_vol, 4),
-            "hours_left": int(hours_left),
+            "metrics": {
+                "yield": round(yield_score, 2),
+                "safe_p": round(price_safety, 2),
+                "safe_v": round(vol_safety, 2)
+            },
+            "hours_left": hours_left,
             "slug": market.get("slug"),
-            "yes_token_id": json.loads(market.get("clobTokenIds", "[]"))[0] if market.get("clobTokenIds") else None,
-            "no_token_id": json.loads(market.get("clobTokenIds", "[]"))[1] if market.get("clobTokenIds") else None
+            "yes_token_id": token_ids[0] if token_ids else None,
+            "no_token_id": token_ids[1] if token_ids else None
         }
 
     async def scan(self):
@@ -306,7 +326,7 @@ class HoneypotService:
             found = [r for r in results if r is not None]
             found_sorted = sorted(found, key=lambda x: x['score'], reverse=True) # 정렬된 리스트 생성
 
-            if found_sorted:
+            if found_sorted or not unique_markets: # 데이터가 아예 없을 때도 캐시 갱신
                 self.update_honeypot_cache(found_sorted)
             
             print(f"✅ 최종 {len(found_sorted)}개의 보상 시장을 탐지했습니다.")

@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     min_daily_reward_usd: float = Field(default=10.0, description="최소 일일 보상액 필터")
     
     # [추가] 유동성 상한선도 설정 파일에서 관리
-    max_existing_depth_usd: float = Field(default=100000.0, description="허용 최대 경쟁 유동성")
+    max_existing_depth_usd: float = Field(default=5000.0, description="허용 최대 경쟁 유동성")
     
     # [수정] 변동성 기준 (센트 단위가 아닌 비율로 관리하는 것이 더 정확함)
     max_volatility_threshold: float = Field(default=0.05, description="허용 최대 가격 변동폭 (5%)")

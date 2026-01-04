@@ -9,6 +9,7 @@ if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware  # [추가 1]
 from src.main import MarketMakerBot
 from src.config import get_settings
 from pydantic import BaseModel
@@ -34,6 +35,14 @@ async def lifespan(app: FastAPI):
     bot_task.cancel()
 
 app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 모든 출처 허용 (개발용)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # [수정] 주문 요청 모델: 'shares' 대신 'amount'로 명칭 변경 (투자 금액 의미 강조)
 class OrderRequest(BaseModel):
@@ -65,8 +74,7 @@ async def get_status():
     mid_price = bot.quote_engine.calculate_mid_price(best_bid, best_ask)
     
     # [중요] 리워드 세이프티 마진 계산 (90% 지점)
-    current_max_spread = getattr(bot, 'current_max_spread', 0.035) # 기본값 3.5c
-    safety_margin = current_max_spread * 0.9 
+    current_spread = getattr(bot, 'spread_cents', 3)
 
     return {
         "is_halted": bot.risk_manager.is_halted,
@@ -79,10 +87,10 @@ async def get_status():
         "market": {
             "market_id": bot.settings.market_id,
             "mid_price": round(mid_price, 4),
+            "margin_usd": round(current_spread * 0.9 / 100.0, 4),
             "best_bid": best_bid,
             "best_ask": best_ask,
-            "spread_cents": bot.current_spread_cents,
-            "margin_usd": round(bot.current_spread_cents * 0.9 / 100.0, 4) # 계산해서 전달
+            "spread_cents": current_spread
         }
     }
 

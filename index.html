@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>Polymarket Pro Terminal</title>
+    <style>
+        :root { 
+            --bg: #0d1117; 
+            --panel: #161b22; 
+            --border: #30363d; 
+            --accent: #238636; 
+            --accent-hover: #2ea043;
+            --text: #c9d1d9; 
+            --text-muted: #8b949e;
+            --red: #da3633; 
+            --gold: #e2b93d; 
+            --blue: #58a6ff;
+        }
+        body { 
+            background-color: var(--bg); 
+            color: var(--text); 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+            margin: 0; 
+            padding: 20px; 
+            font-size: 14px;
+        }
+        
+        /* 레이아웃: 2단 구성 (사이드바 280px / 메인 나머지) */
+        .container { 
+            display: grid; 
+            grid-template-columns: 280px 1fr; 
+            gap: 20px; 
+            max-width: 1400px; 
+            margin: 0 auto; 
+        }
+
+        /* 패널 스타일 */
+        .panel { 
+            background: var(--panel); 
+            border: 1px solid var(--border); 
+            border-radius: 8px; 
+            padding: 20px; 
+            margin-bottom: 20px; 
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        
+        .panel-header { 
+            display: flex; 
+            justify-content: space-between; 
+            align-items: center; 
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid var(--border);
+        }
+        
+        h2 { 
+            margin: 0; 
+            font-size: 16px; 
+            font-weight: 600; 
+            color: var(--text); 
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        /* 상태 박스 */
+        .status-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+        .stat-box { background: #21262d; padding: 12px; border-radius: 6px; text-align: center; }
+        .stat-val { font-size: 18px; font-weight: 700; display: block; margin-bottom: 4px; color: var(--text); }
+        .stat-label { font-size: 12px; color: var(--text-muted); }
+
+        /* 입력 폼 */
+        label { display: block; font-size: 12px; color: var(--text-muted); margin-bottom: 6px; margin-top: 12px; }
+        input[type="text"], input[type="number"] { 
+            background: #0d1117; 
+            border: 1px solid var(--border); 
+            color: var(--text); 
+            padding: 10px; 
+            width: 100%; 
+            border-radius: 6px; 
+            box-sizing: border-box; 
+            font-family: 'Consolas', monospace;
+        }
+        input:focus { outline: none; border-color: var(--blue); }
+        
+        button { 
+            background: var(--accent); 
+            color: white; 
+            border: none; 
+            padding: 12px; 
+            width: 100%; 
+            cursor: pointer; 
+            font-weight: 600; 
+            border-radius: 6px; 
+            margin-top: 15px;
+            transition: background 0.2s;
+        }
+        button:hover { background: var(--accent-hover); }
+
+        /* [수정됨] 테이블 스크롤 래퍼 */
+        .table-wrapper {
+            max-height: 600px; /* 여기서 테이블 높이 조절 */
+            overflow-y: auto;  /* 세로 스크롤바 생성 */
+        }
+
+        /* 테이블 */
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        
+        /* [수정됨] 헤더 고정 (Sticky Header) */
+        th { 
+            text-align: left; 
+            color: var(--text-muted); 
+            padding: 12px 8px; 
+            border-bottom: 1px solid var(--border); 
+            font-weight: 500;
+            cursor: pointer;
+            
+            /* 스크롤 시 헤더 고정 */
+            position: sticky;
+            top: 0;
+            background: var(--panel); /* 스크롤되는 글자가 비치지 않게 배경색 지정 */
+            z-index: 10;
+        }
+        
+        th:hover { color: var(--text); }
+        td { padding: 12px 8px; border-bottom: 1px solid #21262d; vertical-align: middle; }
+        tr:last-child td { border-bottom: none; }
+        tr:hover { background-color: #21262d; cursor: pointer; }
+        
+        .row-selected { background-color: rgba(88, 166, 255, 0.1) !important; }
+
+        /* 뱃지 및 유틸 */
+        .badge { padding: 4px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+        .badge-green { background: rgba(35, 134, 54, 0.2); color: #7ee787; }
+        .badge-blue { background: rgba(56, 139, 253, 0.15); color: #58a6ff; }
+        
+        .profit-pos { color: #7ee787; font-weight: bold; }
+        .profit-neu { color: var(--text-muted); }
+        
+        .logs { 
+            height: 150px; 
+            overflow-y: auto; 
+            font-family: 'Consolas', monospace; 
+            font-size: 12px; 
+            color: var(--text-muted); 
+            line-height: 1.4;
+            background: #0d1117;
+            padding: 10px;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+        }
+
+        /* 시뮬레이션 인풋 커스텀 */
+        .sim-input-group { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-muted); }
+        .sim-input { 
+            width: 80px !important; 
+            padding: 6px !important; 
+            text-align: right; 
+            border-color: var(--border);
+            margin: 0 !important;
+            height: auto;
+        }
+        
+        /* 스크롤바 디자인 (크롬/사파리) */
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: var(--bg); }
+        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <div>
+        <div class="panel">
+            <div class="panel-header"><h2>🤖 System Status</h2></div>
+            <div id="bot-status" class="stat-box" style="cursor: default;">Connecting...</div>
+            
+            <div class="status-grid">
+                <div class="stat-box">
+                    <span id="wallet-usdc" class="stat-val">-</span>
+                    <span class="stat-label">USDC Balance</span>
+                </div>
+                <div class="stat-box">
+                    <span id="wallet-matic" class="stat-val">-</span>
+                    <span class="stat-label">MATIC Gas</span>
+                </div>
+            </div>
+            
+            <div style="margin-top: 15px; font-size: 12px; color: var(--text-muted); display: flex; justify-content: space-between;">
+                <span>Skew: <b id="inv-skew" style="color:var(--text)">-</b></span>
+                <span>Net Exposure: <b id="inv-net" style="color:var(--text)">-</b></span>
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="panel-header"><h2>🚀 Quick Trade</h2></div>
+            
+            <label>Target Market ID</label>
+            <input type="text" id="order-market-id" placeholder="Select from list..." readonly style="cursor: not-allowed; opacity: 0.7;">
+            
+            <label>Investment Amount ($)</label>
+            <input type="number" id="order-amount" value="100">
+            
+            <button onclick="placeOrder()" id="btn-order">Place Buy Order</button>
+        </div>
+
+        <div class="panel">
+            <div class="panel-header"><h2>📝 Active Orders</h2></div>
+            <div id="open-orders" style="font-size: 13px; min-height: 50px; color: var(--text-muted);">No active orders</div>
+        </div>
+    </div>
+
+    <div>
+        <div class="panel">
+            <div class="panel-header">
+                <h2>🍯 Market Opportunities</h2>
+                <div class="sim-input-group">
+                    <span>Simulation Base: $</span>
+                    <input type="number" id="sim-amount" class="sim-input" value="1000" onchange="updateMarkets()">
+                </div>
+            </div>
+            
+            <div class="table-wrapper">
+                <table>
+                    <thead>
+                        <tr>
+                            <th width="8%" onclick="setSort('score')">Score ▾</th>
+                            <th width="40%">Market Title</th>
+                            <th width="12%">Reward/Day</th>
+                            <th width="12%" onclick="setSort('profit')">Est. Profit ▾</th>
+                            <th width="10%">Depth</th>
+                            <th width="10%">Spread</th>
+                            <th width="8%">Mid</th>
+                        </tr>
+                    </thead>
+                    <tbody id="market-table">
+                        <tr><td colspan="7" style="text-align: center; padding: 40px; color: var(--text-muted);">Loading market data...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="panel-header" style="border-bottom: none; margin-bottom: 5px;">
+                <h2>📜 System Logs</h2>
+                <button onclick="clearLogs()" style="width: auto; padding: 4px 8px; font-size: 11px; margin: 0; background: var(--border);">Clear</button>
+            </div>
+            <div id="logs" class="logs"></div>
+        </div>
+    </div>
+</div>
+
+<script>
+    const API_URL = "http://localhost:8000";
+    let sortKey = 'score';
+    let selectedId = null;
+
+    // --- Core Functions ---
+
+    async function updateStatus() {
+        try {
+            const res = await fetch(`${API_URL}/status`);
+            const data = await res.json();
+            
+            const statusBox = document.getElementById('bot-status');
+            if (data.is_halted) {
+                statusBox.textContent = "🚨 HALTED (Click to Reset)";
+                statusBox.style.background = "var(--red)";
+                statusBox.onclick = resetHalt;
+                statusBox.style.cursor = "pointer";
+            } else {
+                statusBox.textContent = "🟢 SYSTEM ONLINE";
+                statusBox.style.background = "var(--accent)";
+                statusBox.onclick = null;
+                statusBox.style.cursor = "default";
+            }
+
+            document.getElementById('inv-skew').textContent = data.inventory.skew.toFixed(2);
+            document.getElementById('inv-net').textContent = Math.round(data.inventory.net_shares);
+        } catch (e) {}
+    }
+
+    async function updateWallet() {
+        try {
+            const res = await fetch(`${API_URL}/wallet`);
+            const data = await res.json();
+            document.getElementById('wallet-usdc').textContent = `$${Math.floor(data.usdc_balance).toLocaleString()}`;
+            document.getElementById('wallet-matic').textContent = data.matic_balance.toFixed(3);
+        } catch (e) {}
+    }
+
+    async function updateMarkets() {
+        try {
+            const res = await fetch(`${API_URL}/honey-pots`);
+            const data = await res.json();
+            const tbody = document.getElementById('market-table');
+            
+            if (data.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; padding: 30px; color: var(--text-muted);">No opportunities found with current filters.</td></tr>';
+                return;
+            }
+
+            const simAmt = parseFloat(document.getElementById('sim-amount').value) || 1000;
+
+            // 수익률 계산
+            data.forEach(m => {
+                let totalPool = m.total_depth + simAmt;
+                m.estProfit = (simAmt / totalPool) * m.reward;
+            });
+
+            // 정렬
+            data.sort((a,b) => {
+                if(sortKey === 'profit') return b.estProfit - a.estProfit;
+                return b.score - a.score;
+            });
+
+            // [수정됨] top10 제한 제거하고 전체 리스트 사용
+            const list = data; 
+
+            let html = '';
+            list.forEach(m => {
+                const isSelected = (m.market_id === selectedId) ? 'row-selected' : '';
+                const profitClass = m.estProfit > 10 ? 'profit-pos' : 'profit-neu';
+                
+                html += `<tr onclick="selectMarket('${m.market_id}')" class="${isSelected}">
+                    <td style="color:var(--gold); font-weight:bold;">${m.score.toFixed(1)}</td>
+                    <td>
+                        <div style="font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width: 380px;">${m.title}</div>
+                    </td>
+                    <td>$${m.reward.toLocaleString()}</td>
+                    <td class="${profitClass}">$${m.estProfit.toFixed(2)}</td>
+                    <td style="color:var(--text-muted)">$${m.total_depth.toLocaleString()}</td>
+                    <td><span class="badge badge-blue">${m.spread_cents}¢</span></td>
+                    <td style="font-family:Consolas">${m.mid_yes.toFixed(3)}</td>
+                </tr>`;
+            });
+            tbody.innerHTML = html;
+        } catch (e) {}
+    }
+
+    async function updateOrdersAndLogs() {
+        // Orders
+        try {
+            const res = await fetch(`${API_URL}/open-orders`);
+            const orders = await res.json();
+            const div = document.getElementById('open-orders');
+            
+            if (orders.length === 0) {
+                div.innerHTML = '<div style="text-align:center; padding:15px; color:var(--text-muted);">No active orders</div>';
+            } else {
+                div.innerHTML = orders.map(o => `
+                    <div style="border-bottom:1px solid #30363d; padding:8px 0; display:flex; justify-content:space-between; align-items:center;">
+                        <div>
+                            <span class="badge" style="background:${o.side==='BUY'?'rgba(35,134,54,0.2)':'rgba(218,54,51,0.2)'}; color:${o.side==='BUY'?'#7ee787':'#f85149'}">${o.side}</span>
+                            <span style="margin-left:5px; font-weight:bold;">${parseFloat(o.size).toFixed(0)}</span>
+                        </div>
+                        <span style="font-family:Consolas; color:var(--text-muted);">@ ${o.price}</span>
+                    </div>
+                `).join('');
+            }
+        } catch (e) {}
+
+        // Logs
+        try {
+            const res = await fetch(`${API_URL}/logs`);
+            const logs = await res.json();
+            const logDiv = document.getElementById('logs');
+            const recentLogs = logs.slice(-50); // 최근 50줄만
+            
+            // 단순 변화 감지
+            if (logDiv.dataset.lastLog !== JSON.stringify(recentLogs)) {
+                logDiv.innerHTML = recentLogs.map(line => `<div>${line}</div>`).join('');
+                logDiv.scrollTop = logDiv.scrollHeight;
+                logDiv.dataset.lastLog = JSON.stringify(recentLogs);
+            }
+        } catch (e) {}
+    }
+
+    // --- Interaction Functions ---
+
+    function selectMarket(id) {
+        selectedId = id;
+        document.getElementById('order-market-id').value = id;
+        updateMarkets(); // 선택 표시 갱신
+        
+        // 버튼 깜빡임 효과
+        const btn = document.getElementById('btn-order');
+        btn.textContent = "Ready to Buy";
+        setTimeout(() => btn.textContent = "Place Buy Order", 1000);
+    }
+
+    async function placeOrder() {
+        const id = document.getElementById('order-market-id').value;
+        const amt = parseFloat(document.getElementById('order-amount').value);
+        
+        if(!id) return alert("Please select a market from the list first.");
+        if(!confirm(`Confirm Buy Order?\n\nMarket: ${id}\nAmount: $${amt}`)) return;
+
+        const btn = document.getElementById('btn-order');
+        const originalText = btn.textContent;
+        btn.textContent = "Processing...";
+        btn.disabled = true;
+
+        try {
+            const res = await fetch(`${API_URL}/place-semi-auto-order`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ market_id: id, amount: amt })
+            });
+            
+            if(res.ok) {
+                // 성공 UI 피드백
+                btn.style.background = "var(--accent)";
+                btn.textContent = "✅ Order Placed!";
+                updateOrdersAndLogs();
+                setTimeout(() => {
+                    btn.textContent = originalText;
+                    btn.disabled = false;
+                }, 2000);
+            } else {
+                const err = await res.json();
+                alert("Order Failed: " + err.detail);
+                btn.textContent = originalText;
+                btn.disabled = false;
+            }
+        } catch(e) {
+            alert("Network Error");
+            btn.textContent = originalText;
+            btn.disabled = false;
+        }
+    }
+
+    async function resetHalt() {
+        if(confirm("Resume system operations?")) {
+            await fetch(`${API_URL}/reset-halt`, {method: 'POST'});
+            updateStatus();
+        }
+    }
+    
+    function clearLogs() {
+        document.getElementById('logs').innerHTML = "";
+    }
+
+    function setSort(key) {
+        sortKey = key;
+        updateMarkets();
+    }
+
+    // --- Init ---
+    setInterval(updateStatus, 1000);
+    setInterval(updateMarkets, 2000);
+    setInterval(updateOrdersAndLogs, 1500);
+    setInterval(updateWallet, 10000);
+    
+    updateStatus(); updateMarkets(); updateWallet(); updateOrdersAndLogs();
+
+</script>
+</body>
+</html>

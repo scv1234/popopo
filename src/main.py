@@ -51,7 +51,7 @@ class MarketMakerBot:
         self.open_orders: dict[str, dict[str, Any]] = {}
         self.last_quote_time = 0.0
 
-        self.current_spread_cents = 3
+        self.spread_cents = 3
 
         self.yes_token_id = ""
         self.no_token_id = ""
@@ -97,6 +97,7 @@ class MarketMakerBot:
         self.yes_token_id = best['yes_token_id']
         self.no_token_id = best['no_token_id']
         self.settings.min_size = best['min_size']
+        self.spread_cents = best.get('spread_cents', 3)
         
         logger.info("honey_pot_activated", market=best['title'], score=best['score'])
         return best
@@ -104,6 +105,9 @@ class MarketMakerBot:
     async def update_orderbook(self):
         """HoneypotService를 사용하여 오더북 업데이트"""
         target_token = self.yes_token_id if self.yes_token_id else self.settings.market_id
+        if not target_token: return
+    
+        # [수정] session을 명시적으로 가져와서 전달해야 합니다.
         session = await self.honeypot_service.get_session()
         self.current_orderbook = await self.honeypot_service.get_orderbook(session, target_token)
 
@@ -161,11 +165,29 @@ class MarketMakerBot:
         """실시간 오더북 변화에 따라 주문의 유효성을 검사하고 방어합니다."""
         if not self.current_orderbook: return
 
-        spread_usd = self.current_spread_cents / 100.0
+        # 1. 기준값 설정
+        spread_usd = self.spread_cents / 100.0
 
-        mid_price = (float(self.current_orderbook.get("best_bid", 0)) + 
-                     float(self.current_orderbook.get("best_ask", 1))) / 2.0           
+        # 2. 현재 시장 데이터 계산
+        best_bid = float(self.current_orderbook.get("best_bid", 0))
+        best_ask = float(self.current_orderbook.get("best_ask", 1))
+        market_spread = best_ask - best_bid  # 시장 스프레드 (최우선 매도 - 최우선 매수)
+        
+        mid_price = (best_bid + best_ask) / 2.0
 
+        # [추가] 🚨 시장 스프레드 과다 이격 방어 (빈집털이 리스크 차단)
+        # 조건: 실제 시장 스프레드가 리워드 허용 범위의 절반(50%)을 초과하면 위험
+        if market_spread > (spread_usd / 2.0):
+            logger.warning("market_spread_too_wide_defense", 
+                           current_spread=round(market_spread, 4), 
+                           limit=round(spread_usd / 2.0, 4),
+                           message="Risk too high, retreating...")
+            
+            # 모든 주문 취소 및 관망
+            await self._reset_local_market_state()
+            return  # 이후 개별 주문 검사는 할 필요 없으므로 종료
+
+        # 3. 개별 주문 위치 방어 (기존 로직)
         for order_id, order in list(self.open_orders.items()):
             price_diff = abs(mid_price - float(order.get("price", 0)))
             
@@ -235,13 +257,21 @@ class MarketMakerBot:
     async def _place_quote(self, quote: Any, outcome: str):
         """리스크 매니저 승인 후 주문 제출"""
         valid, reason = self.risk_manager.validate_order(quote.side, quote.size)
-        if not valid: return
+        if not valid:
+            # [추가] 거절 사유를 로그에 남겨서 확인 가능하게 함
+            logger.warning("order_rejected_by_risk_manager", 
+                           outcome=outcome, 
+                           reason=reason, 
+                           size=quote.size)
+            return False
 
         try:
             order_data = {
                 "market": quote.market, "side": quote.side, "size": str(quote.size),
                 "price": str(quote.price), "token_id": quote.token_id
             }
+            # [디버깅 로그 추가]
+            logger.info("attempting_to_place_order", side=quote.side, price=quote.price)
             result = await self.order_executor.place_order(order_data)
             if result and "id" in result: self.open_orders[result["id"]] = order_data
         except Exception as e:
@@ -252,7 +282,7 @@ class MarketMakerBot:
             await self.order_executor.cancel_all_orders(self.settings.market_id)
             self.open_orders.clear()
 
-    async def execute_manual_safety_order(self, market_id: str, shares: float) -> bool:
+    async def execute_manual_safety_order(self, market_id: str, amount_usd: float) -> bool:
         """
         대시보드 수동 주문 로직: 
         투자 금액($)을 입력받아 YES/NO 양방향에 안전 유동성을 공급합니다.
@@ -293,7 +323,6 @@ class MarketMakerBot:
 
             # 4. 투자 금액($)을 수량(Shares)으로 매핑
             # 델타 뉴트럴 전략에서 $1000 투자는 YES 1000주 + NO 1000주 공급을 의미합니다.
-            target_shares = shares 
 
             # 5. QuoteEngine을 통한 안전 호가 생성
             yes_quote, no_quote = self.quote_engine.generate_quotes(
@@ -304,7 +333,7 @@ class MarketMakerBot:
                 no_token_id=n_id,
                 spread_cents=local_spread_cents,
                 min_size_shares=min_size,
-                user_input_shares=shares
+                user_input_shares=amount_usd
             )
 
             # 6. 최종 주문 실행
@@ -313,8 +342,14 @@ class MarketMakerBot:
             if no_quote: 
                 await self._place_quote(no_quote, "NO")
 
-            logger.info("manual_safety_order_executed", market=market_id, amount=amount_usd)
-            return True
+            # 둘 중 하나라도 성공했다면 로그 기록
+            if success_yes or success_no:
+                logger.info("manual_safety_order_executed", market=market_id, amount=amount_usd)
+                return True
+            else:
+                # 둘 다 실패한 경우
+                logger.error("manual_order_all_failed", market=market_id)
+                return False
 
         except Exception as e:
             logger.error("manual_order_failed", error=str(e))
