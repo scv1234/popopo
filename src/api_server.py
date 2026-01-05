@@ -47,7 +47,9 @@ app.add_middleware(
 # [수정] 주문 요청 모델: 'shares' 대신 'amount'로 명칭 변경 (투자 금액 의미 강조)
 class OrderRequest(BaseModel):
     market_id: str
-    amount: float # 대시보드에서 입력한 총 투자 금액 ($)
+    amount: float
+    yes_token_id: str  # 추가
+    no_token_id: str   # 추가
 
 @app.get("/honey-pots")
 def get_honey_pots():
@@ -101,7 +103,12 @@ async def place_semi_auto_order(req: OrderRequest):
         raise HTTPException(status_code=400, detail="시스템이 중단되었습니다. 먼저 리셋 버튼을 눌러주세요.")
     
     # [수정] 봇의 execute_manual_safety_order 호출 (amount_usd 전달)
-    success = await bot.execute_manual_safety_order(req.market_id, req.amount)
+    success = await bot.execute_manual_safety_order(
+        req.market_id, 
+        req.amount, 
+        req.yes_token_id, 
+        req.no_token_id
+    )
     if not success:
         raise HTTPException(status_code=500, detail="주문 전송에 실패했습니다. 로그를 확인하세요.")
     

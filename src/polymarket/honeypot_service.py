@@ -29,24 +29,37 @@ class HoneypotService:
         self._session = None # [필수 추가] AttributeError 해결을 위한 초기화
 
     async def get_session(self):
+        """[개선] User-Agent 헤더를 추가하여 API 차단(403/429)을 방지합니다."""
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "application/json"
+            }
+            self._session = aiohttp.ClientSession(headers=headers)
         return self._session
 
     async def close(self):
-        # [수정] 세션이 존재할 때만 닫도록 안전하게 처리
         if hasattr(self, '_session') and self._session:
             await self._session.close()
-
-    async def get_market(self, session, market_id: str):
-        """마켓 상세 메타데이터 조회 (Gamma API)"""
-        async with session.get(f"{self.GAMMA_API}/{market_id}") as res:
-            return await res.json() if res.status == 200 else {}
-
+    
     async def get_orderbook(self, session, token_id: str):
-        """실시간 오더북 조회 (CLOB API)"""
-        async with session.get(f"{self.CLOB_API}/book?token_id={token_id}") as res:
-            return await res.json() if res.status == 200 else {}
+        """[수정] 404(오더북 없음)는 에러가 아닌 자연스러운 현상으로 처리"""
+        url = f"{self.CLOB_API}/book?token_id={token_id}"
+        try:
+            async with session.get(url) as res:
+                if res.status == 200:
+                    return await res.json()
+                elif res.status == 404:
+                    # [변경] 404는 단순히 '호가 없음'이므로 에러 로그를 찍지 않고 무시
+                    return {}
+                else:
+                    # 404 외의 진짜 에러(429, 500 등)만 로그 출력
+                    text = await res.text()
+                    logger.error(f"❌ get_orderbook API Error: {res.status} | {text[:100]} | token_id={token_id}")
+                    return {}
+        except Exception as e:
+            logger.error(f"❌ get_orderbook Exception: {e}")
+            return {}
 
     async def get_price_history(self, session, token_id: str):
         """최근 24시간 가격 히스토리 조회 (CLOB API)"""
@@ -86,6 +99,10 @@ class HoneypotService:
             print(f"❌ DB 저장 중 오류 발생: {e}")    
 
     async def get_market_data_complete(self, session, market, semaphore):
+        """
+        [핵심 최적화] 리워드를 먼저 조회하고, 보상이 기준($10) 미달이면 
+        호가창과 히스토리는 조회하지 않고 즉시 종료합니다.
+        """
         condition_id = market.get("conditionId")
         clob_token_ids_raw = market.get("clobTokenIds")
         
@@ -94,48 +111,55 @@ class HoneypotService:
 
         async with semaphore:
             try:
-                # Token ID 리스트 변환
+                # 1단계: 리워드 정보만 먼저 조회 (가장 가벼운 요청)
+                reward_url = f"{self.CLOB_API}/rewards/markets/{condition_id}"
+                async with session.get(reward_url) as res:
+                    if res.status != 200: return None
+                    reward_json = await res.json()
+
+                # 2단계: 리워드 필터링
+                daily_reward = 0
+                if reward_json.get("data") and len(reward_json["data"]) > 0:
+                    r_data = reward_json["data"][0]
+                    daily_reward = float(r_data.get("rewards_daily_rate") or 0)
+                    if daily_reward == 0:
+                        configs = r_data.get("rewards_config", [{}])
+                        daily_reward = float(configs[0].get("rate_per_day") or 0)
+                
+                # 리워드가 기준치($10) 미만이면 호가창 조회를 아예 하지 않음
+                if daily_reward < self.params["min_daily_reward_usd"]:
+                    return None
+
+                # 3단계: 보상 기준 통과 시에만 무거운 데이터(호가창, 히스토리) 조회
                 token_ids = json.loads(clob_token_ids_raw) if isinstance(clob_token_ids_raw, str) else clob_token_ids_raw
                 if not token_ids: return None
 
                 yes_token = token_ids[0]
-                no_token = token_ids[1]                
+                no_token = token_ids[1]
 
-                # 비동기 병렬 호출
                 tasks = [
-                    session.get(f"{self.CLOB_API}/rewards/markets/{condition_id}"),
-                    self.get_orderbook(session, yes_token), # YES 북
-                    self.get_orderbook(session, no_token),  # NO 북
+                    self.get_orderbook(session, yes_token), 
+                    self.get_orderbook(session, no_token),
                     self.get_price_history(session, yes_token)
                 ]
                 responses = await asyncio.gather(*tasks)
 
-                reward_res = responses[0]
-                book_yes = responses[1] # YES
-                book_no = responses[2]  # NO
-                history_data = responses[3]
+                book_yes, book_no, history_data = responses
+                
+                # 데이터가 비어있으면(404 등) 탈락
+                if not book_yes or not book_no: return None
 
-                # [수정된 부분] .status.json() 이 아니라 .json() 입니다.
-                if reward_res.status == 200:
-                    reward_json = await reward_res.json() # <- 여기서 에러가 났었습니다.
-                    
-                    # 24시간 최고/최저가 차이(p 필드) 기반 변동성 계산
-                    volatility = self._calculate_volatility(history_data)
-                    
-                    # 리워드 데이터가 존재하는 경우 최종 점수 계산
-                    if reward_json.get("data") and len(reward_json["data"]) > 0:
-                        # [수정] 점수 계산 시 YES와 NO 북을 모두 전달하도록 파라미터 확장 가능
-                        # 여기서는 일단 기존 구조를 유지하되 YES 북 위주로 계산하고 결과에 NO 정보 추가
-                        return self._calculate_ts_score(
-                            market, 
-                            reward_json["data"][0], 
-                            book_yes, # 메인 계산은 YES 기준
-                            volatility,
-                            book_no=book_no # NO 북 추가 전달
-                        )
+                volatility = self._calculate_volatility(history_data)
+                
+                return self._calculate_ts_score(
+                    market, 
+                    reward_json["data"][0], 
+                    book_yes, 
+                    volatility,
+                    book_no=book_no 
+                )
+
             except Exception as e:
-                # 에러 메시지를 더 자세히 보고 싶다면 아래 주석을 해제하세요
-                logger.error(f"상세 에러: {e}") 
                 pass
         return None
 
@@ -218,7 +242,7 @@ class HoneypotService:
             return None
             
         market_spread = float(a_yes[0]['price']) - float(b_yes[0]['price'])
-        if market_spread > (spread_usd * 2):
+        if market_spread > (spread_usd * 2.5):
             return None
 
         # YES 유동성 및 중간가 계산
@@ -276,6 +300,7 @@ class HoneypotService:
             "depth_no": round(depth_no, 2),
             "total_depth": round(total_depth, 2),
             "volatility": round(volatility, 4),
+            "min_size": min_size,        # <--- 이 줄을 추가하세요!
             "metrics": {
                 "yield": round(yield_score, 2),
                 "safe_p": round(price_safety, 2),

@@ -226,16 +226,15 @@
                     <thead>
                         <tr>
                             <th width="8%" onclick="setSort('score')">Score ▾</th>
-                            <th width="40%">Market Title</th>
-                            <th width="12%">Reward/Day</th>
+                            <th width="32%">Market Title</th> <th width="10%">Min Shares</th>   <th width="12%">Reward/Day</th>
                             <th width="12%" onclick="setSort('profit')">Est. Profit ▾</th>
                             <th width="10%">Depth</th>
-                            <th width="10%">Spread</th>
+                            <th width="8%">Spread</th>
                             <th width="8%">Mid</th>
                         </tr>
                     </thead>
                     <tbody id="market-table">
-                        <tr><td colspan="7" style="text-align: center; padding: 40px; color: var(--text-muted);">Loading market data...</td></tr>
+                        <tr><td colspan="8" style="text-align: center; padding: 40px; color: var(--text-muted);">Loading market data...</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -255,6 +254,7 @@
     const API_URL = "http://localhost:8000";
     let sortKey = 'score';
     let selectedId = null;
+    let marketDataMap = {};
 
     // --- Core Functions ---
 
@@ -295,6 +295,11 @@
             const res = await fetch(`${API_URL}/honey-pots`);
             const data = await res.json();
             const tbody = document.getElementById('market-table');
+
+            marketDataMap = {};
+            data.forEach(m => {
+                marketDataMap[m.market_id] = m;
+            });
             
             if (data.length === 0) {
                 tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; padding: 30px; color: var(--text-muted);">No opportunities found with current filters.</td></tr>';
@@ -326,9 +331,9 @@
                 html += `<tr onclick="selectMarket('${m.market_id}')" class="${isSelected}">
                     <td style="color:var(--gold); font-weight:bold;">${m.score.toFixed(1)}</td>
                     <td>
-                        <div style="font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width: 380px;">${m.title}</div>
+                        <div style="font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width: 320px;">${m.title}</div>
                     </td>
-                    <td>$${m.reward.toLocaleString()}</td>
+                    <td style="color:var(--blue); font-weight:500;">${m.min_size}</td> <td>$${m.reward.toLocaleString()}</td>
                     <td class="${profitClass}">$${m.estProfit.toFixed(2)}</td>
                     <td style="color:var(--text-muted)">$${m.total_depth.toLocaleString()}</td>
                     <td><span class="badge badge-blue">${m.spread_cents}¢</span></td>
@@ -395,6 +400,10 @@
         const amt = parseFloat(document.getElementById('order-amount').value);
         
         if(!id) return alert("Please select a market from the list first.");
+
+        const marketInfo = marketDataMap[id];
+        if (!marketInfo) return alert("Market info not found!");
+        
         if(!confirm(`Confirm Buy Order?\n\nMarket: ${id}\nAmount: $${amt}`)) return;
 
         const btn = document.getElementById('btn-order');
@@ -406,7 +415,12 @@
             const res = await fetch(`${API_URL}/place-semi-auto-order`, {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ market_id: id, amount: amt })
+                body: JSON.stringify({ 
+                    market_id: id, 
+                    amount: amt,
+                    yes_token_id: marketInfo.yes_token_id, // 추가됨
+                    no_token_id: marketInfo.no_token_id    // 추가됨
+                })
             });
             
             if(res.ok) {

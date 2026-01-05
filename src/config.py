@@ -15,7 +15,9 @@ class Settings(BaseSettings):
     polymarket_api_url: str = Field(default="https://clob.polymarket.com")
     polymarket_ws_url: str = Field(default="wss://clob-ws.polymarket.com")
     private_key: str = Field(description="Ethereum private key for signing orders")
-    public_address: str = Field(description="Ethereum public address")
+    
+    # [수정] .env의 PUBLIC_ADDRESS를 Safe 주소로 사용하도록 설정
+    public_address: str = Field(default="", validation_alias="PUBLIC_ADDRESS", description="Polymarket Safe(Proxy) Address")
     rpc_url: str = Field(default="https://polygon-rpc.com")
 
     polymarket_builder_api_key: str = Field(default="")

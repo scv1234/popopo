@@ -1,12 +1,9 @@
 from __future__ import annotations
-
 import asyncio
 import time
 from typing import Any
-
 import httpx
 import structlog
-
 from src.config import Settings
 from src.polymarket.order_signer import OrderSigner
 
@@ -17,64 +14,144 @@ class OrderExecutor:
     def __init__(self, settings: Settings, order_signer: OrderSigner):
         self.settings = settings
         self.order_signer = order_signer
-        self.client = httpx.AsyncClient(timeout=30.0)
+        # 타임아웃을 설정하여 봇이 무한 대기하는 것을 방지합니다.
+        self.client = httpx.AsyncClient(timeout=10.0) 
         self.pending_cancellations: set[str] = set()
+        
+        # 초기 인증 정보 설정
+        self.auth_creds = {
+            "key": self.settings.polymarket_builder_api_key,
+            "secret": self.settings.polymarket_builder_secret,
+            "passphrase": self.settings.polymarket_builder_passphrase
+        }
+        self.safe_address = self.settings.public_address
+
+    async def initialize(self):
+        """[핵심] TypeScript의 initializeClobClient 로직을 수행합니다."""
+        logger.info("initializing_clob_auth")
+        
+        # 1. API 키가 없으면 자동 발급 (TS의 createApiKey)
+        if not self.auth_creds["key"]:
+            await self._auto_create_api_keys()
+
+        # 2. Safe 주소가 없으면 폴리마켓 프로필에서 자동 조회
+        if not self.safe_address:
+            await self._auto_fetch_safe_address()
+
+    async def _auto_fetch_safe_address(self):
+        """서버에서 사용자의 Proxy Wallet(Safe) 주소를 가져옵니다."""
+        try:
+            eoa = self.order_signer.get_address()
+            # 폴리마켓 프로필 엔드포인트 호출
+            resp = await self.client.get(f"https://gamma-api.polymarket.com/profiles?wallet={eoa}")
+            if resp.status_code == 200:
+                data = resp.json()
+                # 프로필 정보에서 proxyAddress 추출
+                if isinstance(data, list) and len(data) > 0:
+                    self.safe_address = data[0].get("proxyAddress")
+                    logger.info("safe_address_auto_fetched", address=self.safe_address)
+            else:
+                logger.warn("safe_address_fetch_failed", status=resp.status_code)
+        except Exception as e:
+            logger.error("safe_address_init_error", error=str(e))
+
+    async def _auto_create_api_keys(self):
+        """TypeScript의 createApiKey 기능을 파이썬으로 구현"""
+        try:
+            timestamp = int(time.time())
+            # 폴리마켓 표준 인증 메시지
+            message = f"Polymarket API Authentication: {timestamp}"
+            signature = self.order_signer.sign_text(message)
+            
+            headers = {"Accept": "application/json", "Content-Type": "application/json"}
+            payload = {
+                "address": self.order_signer.get_address(),
+                "timestamp": timestamp,
+                "signature": signature
+            }
+            
+            # API 키 발급 요청
+            resp = await self.client.post(
+                f"{self.settings.polymarket_api_url}/auth/api-key",
+                json=payload, headers=headers
+            )
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                self.auth_creds = {
+                    "key": data["apiKey"],
+                    "secret": data["secret"],
+                    "passphrase": data["passphrase"]
+                }
+                logger.info("✅ API 키 자동 발급 성공")
+            else:
+                logger.error(f"❌ API 키 발급 실패: {resp.status_code} {resp.text}")
+        except Exception as e:
+            logger.error(f"❌ API 초기화 중 오류: {e}")
 
     def _get_auth_headers(self) -> dict:
-        """[추가] 폴리마켓 CLOB 인증 헤더 생성"""
-        key = self.settings.polymarket_builder_api_key
-        if not key:
-            logger.error("❌ API_KEY_IS_EMPTY: .env 파일을 확인하세요.")
+        """[수정] 동적으로 발급된 인증 정보를 헤더에 사용"""
         return {
-            "POLY-API-KEY": self.settings.polymarket_builder_api_key,
-            "POLY-API-SECRET": self.settings.polymarket_builder_secret,
-            "POLY-API-PASSPHRASE": self.settings.polymarket_builder_passphrase,
+            "POLY-API-KEY": self.auth_creds["key"],
+            "POLY-API-SECRET": self.auth_creds["secret"],
+            "POLY-API-PASSPHRASE": self.auth_creds["passphrase"],
             "Content-Type": "application/json"
-        }    
+        }
 
     def _format_order(self, order: dict[str, Any]) -> dict[str, Any]:
-        """
-        Polymarket CLOB 규격에 맞게 가격과 수량을 포맷팅합니다.
-        - 가격: 소수점 3자리 (Tick Size: 0.001)
-        - 수량: 소수점 2자리 (Step Size: 0.01)
-        """
         formatted = order.copy()
         formatted["price"] = f"{round(float(order['price']), 3):.3f}"
         formatted["size"] = f"{round(float(order['size']), 2):.2f}"
-        return formatted    
+        return formatted   
 
     async def place_order(self, order: dict[str, Any]) -> dict[str, Any]:
-        """주문을 포맷팅하고 서명하여 시장에 제출합니다."""
+        """[최종] 정밀한 페이로드 구성 및 서명 전송"""
         try:
-            # 1. 수량 및 가격 정밀도 조정 (API 거절 방지)
-            order = self._format_order(order)
+            is_buy = order["side"] == "BUY"
+            size = float(order["size"])
+            price = float(order["price"])
             
-            timestamp = int(time.time() * 1000)
-            order["time"] = timestamp
-            order["salt"] = str(int(time.time()))
+            raw_shares = int(round(size * 10**6))
+            raw_usdc = int(round(size * price, 6) * 10**6)
             
-            # 2. 서명 및 주소 추가
-            signature = self.order_signer.sign_order(order)
-            order["signature"] = signature
-            order["maker"] = self.order_signer.get_address()
+            # EIP-712 규격에 맞춘 데이터 구성
+            prep_data = {
+                "maker": self.settings.public_address,
+                "taker": "0x0000000000000000000000000000000000000000",
+                "tokenId": str(order["token_id"]),
+                "makerAmount": str(raw_usdc if is_buy else raw_shares),
+                "takerAmount": str(raw_shares if is_buy else raw_usdc),
+                "side": 0 if is_buy else 1,
+                "feeRateBps": 0,
+                "nonce": 0,
+                "signer": self.order_signer.get_address(),
+                "expiration": int(time.time()) + 3600,
+                "salt": int(time.time()),
+                "signatureType": 2 # Safe Proxy
+            }
+            
+            # 서명 생성
+            signature = self.order_signer.sign_order(prep_data)
+            
+            # 최종 페이로드
+            final_payload = {**prep_data, "signature": signature}
             
             response = await self.client.post(
                 f"{self.settings.polymarket_api_url}/order",
-                json=order,
-                headers=self._get_auth_headers(), # 인증 헤더 적용
+                json=final_payload,
+                headers=self._get_auth_headers(),
             )
             response.raise_for_status()
             
             result = response.json()
-            logger.info("order_placed_success", 
-                        order_id=result.get("id"), 
-                        side=order.get("side"), 
-                        price=order["price"], 
-                        size=order["size"])
+            logger.info("order_placed_success", order_id=result.get("id"))
             return result
         except Exception as e:
-            logger.error("order_placement_failed", error=str(e), order=order)
+            logger.error("order_placement_failed", error=str(e))
             raise
+
+    async def close(self):
+        await self.client.aclose()
 
     async def cancel_order(self, order_id: str) -> bool:
         """개별 주문 취소 (방어 로직 실시간 가동용)"""

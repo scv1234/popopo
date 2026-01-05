@@ -273,86 +273,125 @@ class MarketMakerBot:
             # [디버깅 로그 추가]
             logger.info("attempting_to_place_order", side=quote.side, price=quote.price)
             result = await self.order_executor.place_order(order_data)
-            if result and "id" in result: self.open_orders[result["id"]] = order_data
+            if result and "id" in result: 
+                self.open_orders[result["id"]] = order_data
+                return True
         except Exception as e:
             logger.error("placement_failed", error=str(e))
+        return False    
 
     async def _cancel_stale_orders(self):
         if self.open_orders:
             await self.order_executor.cancel_all_orders(self.settings.market_id)
             self.open_orders.clear()
 
-    async def execute_manual_safety_order(self, market_id: str, amount_usd: float) -> bool:
+    async def execute_manual_safety_order(self, market_id: str, amount_usd: float, yes_id: str = None, no_id: str = None) -> bool:
         """
-        대시보드 수동 주문 로직: 
-        투자 금액($)을 입력받아 YES/NO 양방향에 안전 유동성을 공급합니다.
+        [수정됨] session.get을 올바르게 처리하여 리워드 정보와 호가창을 가져옵니다.
         """
         try:
-            # 1. 세션 및 마켓 기본 정보(Gamma) 가져오기
             session = await self.honeypot_service.get_session()
-            market_details = await self.honeypot_service.get_market(session, market_id)
             
-            condition_id = market_details.get("conditionId")
-            clob_token_ids = json.loads(market_details.get("clobTokenIds", "[]"))
-            
-            if not condition_id or len(clob_token_ids) < 2:
-                logger.error("invalid_market_data", market_id=market_id)
-                return False
+            # 1. Token ID 누락 시 Fallback (CLOB API 조회)
+            if not yes_id or not no_id:
+                logger.info("fetching_missing_token_ids", market_id=market_id)
+                clob_url = f"{self.honeypot_service.CLOB_API}/markets/{market_id}"
+                async with session.get(clob_url) as res:
+                    if res.status != 200:
+                        logger.error("market_not_found_clob", status=res.status)
+                        return False
+                    data = await res.json()
+                    tokens = data.get("tokens", [])
+                    if len(tokens) >= 2:
+                        yes_id = next((t['token_id'] for t in tokens if t.get('outcome') == 'Yes'), tokens[0]['token_id'])
+                        no_id = next((t['token_id'] for t in tokens if t.get('outcome') == 'No'), tokens[1]['token_id'])
+                    else:
+                        logger.error("tokens_empty")
+                        return False
 
-            y_id, n_id = clob_token_ids[0], clob_token_ids[1]
+            # [핵심 수정] session.get을 안전하게 수행하는 내부 헬퍼 함수 정의
+            async def fetch_json(url):
+                try:
+                    async with session.get(url) as res:
+                        if res.status == 200:
+                            return await res.json()
+                except Exception:
+                    pass
+                return {}
 
-            # 2. 리워드 설정 및 오더북 정보 병렬 조회
+            # 2. 병렬 데이터 조회 (수정된 fetch_json 사용)
+            # - 리워드 정보: Condition ID 사용
+            # - 호가창: YES Token ID 사용
             tasks = [
-                session.get(f"{self.honeypot_service.CLOB_API}/rewards/markets/{condition_id}"),
-                self.honeypot_service.get_orderbook(session, y_id)
+                fetch_json(f"{self.honeypot_service.CLOB_API}/rewards/markets/{market_id}"),
+                self.honeypot_service.get_orderbook(session, yes_id)
             ]
-            responses = await asyncio.gather(*tasks)
             
-            reward_res = responses[0]
+            responses = await asyncio.gather(*tasks)
+            reward_json = responses[0]
             orderbook = responses[1]
 
+            # [핵심 수정] 리스트에서 직접 Best Bid/Ask 추출
+            # CLOB API 결과는 {"bids": [{"price": "0.5", "size": "100"}, ...], "asks": [...]} 형태임
+            bids = orderbook.get("bids", [])
+            asks = orderbook.get("asks", [])
+            
+            # 1. 명시적 정렬: API 응답이 정렬되어 있지 않을 경우를 대비함
+            # 매수(Bids): 가장 높은 가격이 위로 (내림차순)
+            if bids:
+                bids.sort(key=lambda x: float(x['price']), reverse=True)
+            # 매도(Asks): 가장 낮은 가격이 위로 (오름차순)
+            if asks:
+                asks.sort(key=lambda x: float(x['price']))
+
+            # 2. 최우선 호가(Best Bid/Ask) 추출
+            # 정렬된 리스트의 0번째가 항상 가장 유리한 가격입니다.
+            best_bid = float(bids[0]['price']) if bids else 0.0
+            best_ask = float(asks[0]['price']) if asks else 1.0
+
             # 3. 리워드 파라미터 추출
-            reward_data = {}
-            if reward_res.status == 200:
-                reward_json = await reward_res.json()
-                if reward_json.get("data"):
-                    reward_data = reward_json["data"][0]
+            local_spread_cents = 3
+            min_size = 20.0
+            
+            if reward_json and reward_json.get("data"):
+                r_data = reward_json["data"][0]
+                local_spread_cents = int(float(r_data.get("rewards_max_spread", 3)))
+                min_size = float(r_data.get("rewards_min_size", 20))
 
-            local_spread_cents = int(float(reward_data.get("rewards_max_spread", 3)))
-            min_size = float(reward_data.get("rewards_min_size", 20))
-
-            # 4. 투자 금액($)을 수량(Shares)으로 매핑
-            # 델타 뉴트럴 전략에서 $1000 투자는 YES 1000주 + NO 1000주 공급을 의미합니다.
-
-            # 5. QuoteEngine을 통한 안전 호가 생성
+            # 4. 호가 생성
             yes_quote, no_quote = self.quote_engine.generate_quotes(
                 market_id=market_id,
-                best_bid=float(orderbook.get("best_bid", 0)),
-                best_ask=float(orderbook.get("best_ask", 1)),
-                yes_token_id=y_id, 
-                no_token_id=n_id,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                yes_token_id=yes_id, 
+                no_token_id=no_id,
                 spread_cents=local_spread_cents,
                 min_size_shares=min_size,
                 user_input_shares=amount_usd
             )
 
-            # 6. 최종 주문 실행
-            if yes_quote: 
-                await self._place_quote(yes_quote, "YES")
-            if no_quote: 
-                await self._place_quote(no_quote, "NO")
+            # 5. 주문 전송
+            success_yes = False
+            success_no = False
 
-            # 둘 중 하나라도 성공했다면 로그 기록
+            if yes_quote: 
+                success_yes = await self._place_quote(yes_quote, "YES")
+            else:
+                # 호가 생성 실패 시 원인 로그 (디버깅용)
+                llogger.warning("quote_gen_failed_yes", bid=best_bid, ask=best_ask, mid=(best_bid+best_ask)/2)
+
+            if no_quote: 
+                success_no = await self._place_quote(no_quote, "NO")
+
             if success_yes or success_no:
-                logger.info("manual_safety_order_executed", market=market_id, amount=amount_usd)
+                logger.info("manual_safety_order_executed", market=market_id)
                 return True
             else:
-                # 둘 다 실패한 경우
                 logger.error("manual_order_all_failed", market=market_id)
                 return False
 
         except Exception as e:
-            logger.error("manual_order_failed", error=str(e))
+            logger.error("manual_order_exception", error=str(e))
             return False
 
     async def run_auto_redeem(self):
@@ -363,6 +402,10 @@ class MarketMakerBot:
     #6. 메인루프
 
     async def run(self):
+        logger.info("bot_starting")
+        
+        # [추가] 봇 시작 시 자동 인증 수행 (TypeScript 방식)
+        await self.executor.initialize()
         self.running = True
         market_info = await self.discover_market()
         if not market_info: return
