@@ -186,9 +186,10 @@ class MarketMakerBot:
         # 3. 개별 주문 위치 방어 (기존 로직)
         for order_id, order in list(self.open_orders.items()):
             price_diff = abs(mid_price - float(order.get("price", 0)))
-            
+
+            safe_buffer = max(spread_usd * 0.1, 0.002)
             # 방어 트리거 조건 (체결 위험 OR 리워드 실격)
-            is_risky = price_diff < (spread_usd * 0.1) # 10% 지점 이내면 위험
+            is_risky = price_diff < safe_buffer # 10% 지점 이내면 위험
             is_invalid = price_diff > spread_usd     # 범위를 벗어나면 실격
             
             if is_risky or is_invalid:
@@ -482,3 +483,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
 
         pass
+
