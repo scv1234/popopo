@@ -56,6 +56,8 @@ class MarketMakerBot:
         self.no_token_id = ""
         self.spread_cents = 3
         self.min_size = 20.0
+
+        self.trade_timestamps = []
     
     #2. 마켓 탐색
 
@@ -106,14 +108,33 @@ class MarketMakerBot:
             asyncio.create_task(self.check_and_defend_orders())     
             
     def _handle_trade_update(self, data: dict[str, Any]):
+        """웹소켓 체결 업데이트 및 독성 흐름 대응"""
         side, size, token_id = data.get("side"), float(data.get("size", 0)), data.get("token_id")
         actual_price, order_id = float(data.get("price", 0)), data.get("order_id")
         
+        # 1. 인벤토리 실시간 업데이트 및 사후 방어 가동
         yes_delta = size if token_id == self.yes_token_id and side == "BUY" else (-size if token_id == self.yes_token_id else 0)
         no_delta = size if token_id == self.no_token_id and side == "BUY" else (-size if token_id == self.no_token_id else 0)
         
         self.inventory_manager.update_inventory(yes_delta, no_delta)
         asyncio.create_task(self._defend_after_trade(actual_price, order_id))
+
+        # 2. [독성 흐름 감지] 10초 내 5회 이상 체결 시 공격으로 간주
+        now = time.time()
+        self.trade_timestamps.append(now)
+        self.trade_timestamps = [t for t in self.trade_timestamps if now - t < 10]
+        
+        if len(self.trade_timestamps) >= 5:
+            logger.warning("🚨 TOXIC_FLOW_DETECTED", count=len(self.trade_timestamps))
+            
+            # 봇 가동 중단 (추가 주문 방지)
+            self.risk_manager.is_halted = True
+            
+            # [핵심] 거래소의 모든 주문을 즉시 취소하여 추가 피해 차단
+            asyncio.create_task(self._emergency_cancel_all())
+            
+            # 30초 쿨다운 후 재개
+            asyncio.create_task(self._cool_down_and_resume(30))
 
     #4. 리스크 관리  
 
@@ -257,7 +278,7 @@ class MarketMakerBot:
 
     async def _place_quote(self, quote: Any, outcome: str):
         """리스크 매니저 승인 후 주문 제출"""
-        valid, reason = self.risk_manager.validate_order(quote.side, quote.size)
+        valid, reason = self.risk_manager.validate_order(quote.side, quote.size, self.current_orderbook)
         if not valid:
             # [추가] 거절 사유를 로그에 남겨서 확인 가능하게 함
             logger.warning("order_rejected_by_risk_manager", 
@@ -485,5 +506,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
 
         pass
+
 
 
