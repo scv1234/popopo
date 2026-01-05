@@ -96,6 +96,52 @@ class MarketMakerBot:
         session = await self.honeypot_service.get_session()
         self.current_orderbook = await self.honeypot_service.get_orderbook(session, target_token)
 
+    async def handle_emergency(self, reason: str, exit_position: bool = False):
+        """
+        [통합 비상 대응] 상황에 맞게 주문 취소 및 포지션 정리를 수행합니다.
+        """
+        logger.error("🚨 EMERGENCY_TRIGGERED", reason=reason, exit=exit_position)
+        
+        # 1단계: 즉시 새 주문 중단 (Halt)
+        self.risk_manager.is_halted = True
+
+        try:
+            # 2단계: 현재 마켓의 모든 미체결 주문 즉각 취소
+            if self.current_market_id:
+                cancelled_count = await self.order_executor.cancel_all_orders(self.current_market_id)
+                self.open_orders.clear()
+                logger.info("🛡️ Orders cleared from exchange", count=cancelled_count)
+
+            # 3단계: 치명적 상황 시 시장가 탈출 (Liquidation)
+            if exit_position:
+                logger.warning("📉 CRITICAL_CONDITION: Liquidating all positions...")
+                await self._liquidate_all_positions()
+
+            # 4단계: 30초 쿨다운 후 안전 재개 예약
+            asyncio.create_task(self._cool_down_and_resume(30))
+
+        except Exception as e:
+            logger.error("emergency_handler_error", error=str(e))
+
+    async def _liquidate_all_positions(self):
+        """인벤토리의 모든 토큰을 시장가로 즉시 정리합니다."""
+        inv = self.inventory_manager.inventory
+        if inv.yes_shares > 0:
+            await self.order_executor.place_market_order(
+                self.current_market_id, "SELL", inv.yes_shares, self.yes_token_id)
+        if inv.no_shares > 0:
+            await self.order_executor.place_market_order(
+                self.current_market_id, "SELL", inv.no_shares, self.no_token_id)
+        logger.info("✅ All positions liquidated to cash.")
+
+    async def _cool_down_and_resume(self, seconds: int):
+        """시장을 관망한 후 봇을 정상 상태로 복구합니다."""
+        await asyncio.sleep(seconds)
+        self.risk_manager.reset_halt()
+        self.trade_timestamps.clear()
+        logger.info(f"🛡️ Safety cool-down ({seconds}s) finished. Resuming operation...")
+
+    
     #3. 호가창 및 체결 내역 데이터 정리  
 
     def _handle_orderbook_update(self, data: dict[str, Any]):
@@ -495,6 +541,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
 
         pass
+
 
 
 
