@@ -191,19 +191,6 @@ class MarketMakerBot:
         if abs(hedge_needed) >= 1.0: 
             await self.execute_auto_hedge(hedge_needed)
 
-    async def _emergency_market_exit(self):
-        """비상 상황 시 즉시 모든 포지션을 정리하고 시장에서 철수합니다."""
-        logger.critical("🚨 EMERGENCY_EXIT_INITIATED")
-        
-        # 모든 주문 취소와 상태 초기화를 원자적으로 수행
-        await self.order_executor.cancel_all_orders(self.settings.market_id)
-        self.open_orders.clear()
-        
-        # 공격적인 시장가 헤징으로 포지션 0화
-        hedge_needed = self.risk_manager.calculate_hedge_need()
-        if abs(hedge_needed) >= 1.0:
-            await self.execute_auto_hedge(hedge_needed, aggressive=True)
-
     async def check_and_defend_orders(self):
         """실시간 오더북 변화에 따라 주문의 유효성을 검사하고 방어합니다."""
         if not self.current_orderbook: return
@@ -541,8 +528,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
 
         pass
-
-
-
-
 
