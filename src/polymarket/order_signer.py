@@ -17,7 +17,8 @@ class OrderSigner:
     def sign_text(self, text: str) -> str:
         """[추가] API 키 발급 시 필요한 일반 텍스트 서명"""
         message = encode_defunct(text=text)
-        return self.account.sign_message(message).signature.hex()
+        signed_message = self.account.sign_message(message)
+        return signed_message.signature.hex()
 
     def sign_order(self, order_data: dict[str, Any]) -> str:
         """폴리마켓 CLOB EIP-712 서명 (기존 로직 동일)"""
@@ -58,12 +59,15 @@ class OrderSigner:
                 "salt": int(order_data["salt"]),
                 "signatureType": int(order_data["signatureType"])
             }
-            full_data = {"types": types, "domain": domain, "primaryType": "Order", "message": message}
-            try:
-                structured_data = encode_typed_data(full_message=full_data)
-            except:
-                structured_data = encode_typed_data(full_data)
-            return self.account.sign_message(structured_data).signature.hex()
+            structured_data = encode_typed_data(
+                domain_data=domain, 
+                types=types, 
+                primary_type="Order", 
+                message=message
+            )
+            signed_message = self.account.sign_message(structured_data)
+            return signed_message.signature.hex()
         except Exception as e:
-            logger.error("order_signing_failed", error=str(e))
+            logger.error("order_signing_failed", error=str(e), order_data=order_data)
+
             raise
