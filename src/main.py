@@ -229,7 +229,6 @@ class MarketMakerBot:
             logger.error("hedge_failed", error=str(e))
 
     async def refresh_quotes(self):
-        """[수정] 인자값에 의존하지 않고 최신 상태(self.current_market_id 등)를 사용"""
         if not self.current_market_id: return
         
         now_ms = time.time() * 1000
@@ -238,15 +237,18 @@ class MarketMakerBot:
         self.last_quote_time = now_ms
 
         await self.update_orderbook()
+
+        vol_1h = float(self.current_orderbook.get("volatility_1h", 0.005))
         
         yes_q, no_q = self.quote_engine.generate_quotes(
-            self.current_market_id, 
-            float(self.current_orderbook.get("best_bid", 0)),
-            float(self.current_orderbook.get("best_ask", 1)),
-            self.yes_token_id, 
-            self.no_token_id,
-            self.spread_cents,
-            self.min_size
+            market_id=self.current_market_id, 
+            best_bid=float(self.current_orderbook.get("best_bid", 0)),
+            best_ask=float(self.current_orderbook.get("best_ask", 1)),
+            yes_token_id=self.yes_token_id, 
+            no_token_id=self.no_token_id,
+            spread_cents=self.spread_cents,
+            min_size_shares=self.min_size,
+            volatility_1h=vol_1h     # 전달
         )
 
         await self._cancel_stale_orders()
@@ -483,4 +485,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
 
         pass
+
 
