@@ -156,23 +156,32 @@ class MarketMakerBot:
         spread_usd = self.spread_cents / 100.0
 
         # 2. 현재 시장 데이터 계산
-        best_bid = float(self.current_orderbook.get("best_bid", 0))
-        best_ask = float(self.current_orderbook.get("best_ask", 1))
-        market_spread = best_ask - best_bid  # 시장 스프레드 (최우선 매도 - 최우선 매수)
+        # [수정] 오더북에서 최우선 호가를 더 안전하게 추출
+        bids = self.current_orderbook.get("bids", [])
+        asks = self.current_orderbook.get("asks", [])
+        
+        if not bids or not asks:
+            return
+
+        best_bid = float(bids[0]['price'])
+        best_ask = float(asks[0]['price'])
+        market_spread = best_ask - best_bid  # 시장 스프레드
         
         mid_price = (best_bid + best_ask) / 2.0
 
-        # [추가] 🚨 시장 스프레드 과다 이격 방어 (빈집털이 리스크 차단)
-        # 조건: 실제 시장 스프레드가 리워드 허용 범위의 절반(50%)을 초과하면 위험
-        if market_spread > (spread_usd / 2.0):
+        # [수정] 🚨 시장 스프레드 과다 이격 방어 (HoneypotService와 동기화)
+        # 빈집 마켓 공략을 위해 리워드 스프레드의 2.5배까지 허용합니다.
+        limit_spread = spread_usd * 2.5
+        
+        if market_spread > limit_spread:
             logger.warning("market_spread_too_wide_defense", 
                            current_spread=round(market_spread, 4), 
-                           limit=round(spread_usd / 2.0, 4),
-                           message="Risk too high, retreating...")
+                           limit=round(limit_spread, 4),
+                           message="Spread exceeds 2.5x of reward spread. Retreating...")
             
             # 모든 주문 취소 및 관망
             await self._reset_local_market_state()
-            return  # 이후 개별 주문 검사는 할 필요 없으므로 종료
+            return
 
         # 3. 개별 주문 위치 방어 (기존 로직)
         for order_id, order in list(self.open_orders.items()):
@@ -471,4 +480,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(bootstrap(settings))
     except KeyboardInterrupt:
+
         pass
