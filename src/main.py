@@ -51,63 +51,50 @@ class MarketMakerBot:
         self.open_orders: dict[str, dict[str, Any]] = {}
         self.last_quote_time = 0.0
 
-        self.spread_cents = 3
-
+        self.current_market_id = settings.market_id
         self.yes_token_id = ""
         self.no_token_id = ""
+        self.spread_cents = 3
+        self.min_size = 20.0
     
     #2. 마켓 탐색
 
+    async def _apply_market_target(self, market_data: dict[str, Any]):
+        # 1. 먼저 새로운 마켓 정보를 인스턴스 변수에 저장합니다.
+        old_market_id = self.current_market_id
+        self.current_market_id = market_data['market_id']
+        self.yes_token_id = market_data['yes_token_id']
+        self.no_token_id = market_data['no_token_id']
+        self.min_size = market_data['min_size']
+        self.spread_cents = market_data.get('spread_cents', 3)
+
+        # 2. 이전 마켓이 있었다면 해당 마켓의 주문만 취소합니다.
+        if old_market_id:
+            await self.order_executor.cancel_all_orders(old_market_id)
+            self.open_orders.clear()
+
+        # 3. 새로운 마켓 구독
+        await self.ws_client.subscribe_orderbook(self.current_market_id)
+
     async def run_market_discovery_loop(self):
-        """[통합 루프] 10분마다 시장 스캔 및 봇 타겟 자동 전환"""
+        """10분마다 시장 스캔 및 봇 타겟 자동 전환"""
         while self.running:
             try:
-                logger.info("🔎 주기적 시장 스캔 및 꿀통 탐색 시작...")
                 candidates = await self.honeypot_service.scan()
-                
                 if candidates:
                     best = candidates[0]
-                    if self.settings.market_id != best['market_id']:
-                        logger.info(f"🔄 최적 마켓 발견, 전환합니다: {best['title']}")
-                        await self._reset_local_market_state() # 기존 마켓 주문 취소 및 초기화
-                        
-                        # 설정 업데이트
-                        self.settings.market_id = best['market_id']
-                        self.yes_token_id = best['yes_token_id']
-                        self.no_token_id = best['no_token_id']
-                        self.settings.min_size = best['min_size']
-                        self.spread_cents = best.get('spread_cents', 3) # 단위 통일
-                        
-                        # 웹소켓 재구독
-                        await self.ws_client.subscribe_orderbook(self.settings.market_id)
-                
+                    if self.current_market_id != best['market_id']:
+                        await self._apply_market_target(best)
             except Exception as e:
-                logger.error(f"🚨 탐색 루프 에러: {e}")
+                logger.error("market_discovery_loop_error", error=str(e))
             await asyncio.sleep(600)
-
-    async def discover_market(self) -> dict[str, Any] | None:
-        """최고 점수 마켓을 찾아 초기 세팅을 완료합니다."""
-        candidates = await self.honeypot_service.scan()
-        if not candidates:
-            logger.warning("no_honeypot_found")
-            return None
-        
-        best = candidates[0]
-        self.settings.market_id = best['market_id']
-        self.yes_token_id = best['yes_token_id']
-        self.no_token_id = best['no_token_id']
-        self.settings.min_size = best['min_size']
-        self.spread_cents = best.get('spread_cents', 3)
-        
-        logger.info("honey_pot_activated", market=best['title'], score=best['score'])
-        return best
 
     async def update_orderbook(self):
         """HoneypotService를 사용하여 오더북 업데이트"""
-        target_token = self.yes_token_id if self.yes_token_id else self.settings.market_id
+        target_token = self.yes_token_id or self.current_market_id
         if not target_token: return
-    
-        # [수정] session을 명시적으로 가져와서 전달해야 합니다.
+        
+        # [수정] 세션을 안전하게 가져와서 전달
         session = await self.honeypot_service.get_session()
         self.current_orderbook = await self.honeypot_service.get_orderbook(session, target_token)
 
@@ -215,39 +202,41 @@ class MarketMakerBot:
         """인벤토리 불균형 해소를 위한 헤징 주문"""
         try:
             target_token = self.yes_token_id if amount > 0 else self.no_token_id
-            if aggressive:
-                target_price = 0.99
-            else:
-                book = await self.honeypot_service.get_orderbook(target_token)
+            target_price = 0.99
+            
+            if not aggressive:
+                # [수정] 세션 인자 추가 전달
+                session = await self.honeypot_service.get_session()
+                book = await self.honeypot_service.get_orderbook(session, target_token)
                 target_price = float(book.get("best_ask", 0.99))
 
             hedge_order = {
-                "market": self.settings.market_id, "side": "BUY", "size": str(abs(amount)),
+                "market": self.current_market_id, "side": "BUY", "size": str(abs(amount)),
                 "price": str(target_price), "token_id": target_token
             }
             await self.order_executor.place_order(hedge_order)
         except Exception as e:
             logger.error("hedge_failed", error=str(e))
 
-    async def refresh_quotes(self, market_info: dict[str, Any]):
-        """최신 가격에 맞춰 MM 주문 갱신"""
+    async def refresh_quotes(self):
+        """[수정] 인자값에 의존하지 않고 최신 상태(self.current_market_id 등)를 사용"""
+        if not self.current_market_id: return
+        
         now_ms = time.time() * 1000
         if (now_ms - self.last_quote_time) < self.settings.quote_refresh_rate_ms:
             return
         self.last_quote_time = now_ms
 
-        if not self.current_orderbook: await self.update_orderbook()
-        
-        self.spread_cents = market_info.get('spread_cents', 3)
+        await self.update_orderbook()
         
         yes_q, no_q = self.quote_engine.generate_quotes(
-            self.settings.market_id, 
+            self.current_market_id, 
             float(self.current_orderbook.get("best_bid", 0)),
             float(self.current_orderbook.get("best_ask", 1)),
             self.yes_token_id, 
             self.no_token_id,
-            self.spread_cents, # 정수형 센트 전달
-            self.settings.min_size
+            self.spread_cents,
+            self.min_size
         )
 
         await self._cancel_stale_orders()
@@ -378,7 +367,7 @@ class MarketMakerBot:
                 success_yes = await self._place_quote(yes_quote, "YES")
             else:
                 # 호가 생성 실패 시 원인 로그 (디버깅용)
-                llogger.warning("quote_gen_failed_yes", bid=best_bid, ask=best_ask, mid=(best_bid+best_ask)/2)
+                logger.warning("quote_gen_failed_yes", bid=best_bid, ask=best_ask, mid=(best_bid+best_ask)/2)
 
             if no_quote: 
                 success_no = await self._place_quote(no_quote, "NO")
@@ -403,44 +392,50 @@ class MarketMakerBot:
 
     async def run(self):
         logger.info("bot_starting")
-        
-        # [추가] 봇 시작 시 자동 인증 수행 (TypeScript 방식)
-        await self.executor.initialize()
+    
+        # 1. 인증 및 초기화
+        await self.order_executor.initialize()
         self.running = True
-        market_info = await self.discover_market()
-        if not market_info: return
 
+        # 2. 초기 마켓 탐색 (초기 1회만 동기식으로 실행하여 타겟 설정)
+        candidates = await self.honeypot_service.scan()
+        if candidates:
+            await self._apply_market_target(candidates[0])
+        else:
+            logger.warning("no_initial_honeypot_found_waiting_for_loop")
+
+        # 3. 핸들러 등록 및 웹소켓 연결
         self.ws_client.register_handler("l2_book", self._handle_orderbook_update)
         self.ws_client.register_handler("user", self._handle_trade_update)
-        
-        await self.update_orderbook()
-        
-        if self.settings.market_discovery_enabled:
-            await self.ws_client.connect()
-            await self.ws_client.subscribe_orderbook(self.settings.market_id)
-            await self.ws_client.subscribe_user(self.order_signer.get_address())
+    
+        await self.ws_client.connect()
+        await self.ws_client.subscribe_user(self.order_signer.get_address())
+        # 초기 마켓이 설정되었다면 구독 시도
+        if self.current_market_id:
+            await self.ws_client.subscribe_orderbook(self.current_market_id)
 
-        # 모든 루프를 병렬 실행
+        # 4. 병렬 루프 실행
         tasks = [
             asyncio.create_task(self.run_market_discovery_loop()),
-            asyncio.create_task(self.run_cancel_replace_cycle(market_info)),
+            asyncio.create_task(self.run_cancel_replace_cycle()),
             asyncio.create_task(self.run_auto_redeem())
         ]
-        if self.ws_client.running: tasks.append(self.ws_client.listen())
-        
+        if self.ws_client.running:
+            tasks.append(self.ws_client.listen())
+    
         try:
             await asyncio.gather(*tasks)
         finally:
             await self.cleanup()
 
-    async def run_cancel_replace_cycle(self, market_info: dict[str, Any]):
+    async def run_cancel_replace_cycle(self):
         while self.running:
             try:
                 if not self.risk_manager.is_halted:
-                    await self.refresh_quotes(market_info)
+                    await self.refresh_quotes()
                 await asyncio.sleep(self.settings.cancel_replace_interval_ms / 1000.0)
             except Exception as e:
-                logger.error("loop_error", error=str(e))
+                logger.error("quote_loop_error", error=str(e))
                 await asyncio.sleep(1)
 
     async def cleanup(self):

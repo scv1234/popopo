@@ -16,9 +16,11 @@ class AutoRedeem:
 
     async def check_redeemable_positions(self, address: str) -> list[dict[str, Any]]:
         try:
-            # 리딤 가능한(결과가 확정된) 포지션 조회
+            # [수정] CLOB API 대신 Gamma API 사용
+            gamma_api_url = "https://gamma-api.polymarket.com/positions"
+            
             response = await self.client.get(
-                f"{self.settings.polymarket_api_url}/positions",
+                gamma_api_url,
                 params={"user": address, "redeemable": "true"},
             )
             response.raise_for_status()
