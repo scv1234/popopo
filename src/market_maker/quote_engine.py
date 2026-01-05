@@ -39,7 +39,7 @@ class QuoteEngine:
         no_token_id: str, 
         spread_cents: float,
         min_size_shares: float,
-        volatility: float = 0.01,         # [고도화] 변동성 인자 추가
+        volatility_1h: float = 0.005,         # [고도화] 변동성 인자 추가
         user_input_shares: float = None, 
     ) -> tuple[Quote | None, Quote | None]:
         """
@@ -60,7 +60,7 @@ class QuoteEngine:
 
         # 2. [고도화] 동적 스프레드 (Dynamic Spread)
         # 변동성이 높을수록 안전 마진을 위해 스프레드를 확대합니다. (1.0x ~ 2.5x)
-        volatility_multiplier = max(1.0, min(2.5, 1 + (volatility * 15)))
+        volatility_multiplier = max(1.0, min(3.0, 1 + (volatility_1h * 100))) 
         dynamic_spread_usd = (spread_cents * volatility_multiplier) / 100.0
 
         # 3. [고도화] 가격 스큐 (Price Skewing)
@@ -125,5 +125,6 @@ class QuoteEngine:
         """마감 임박 시 리스크 방지를 위해 주문을 중단합니다."""
         # 설정파일의 avoid_near_expiry_hours와 연동 가능
         return time_to_close_hours < 1.0
+
 
 
