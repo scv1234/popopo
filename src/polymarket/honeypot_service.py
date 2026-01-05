@@ -150,12 +150,14 @@ class HoneypotService:
                 if not book_yes or not book_no: return None
 
                 volatility = self._calculate_volatility(history_data)
+                volatility_1h = self._calculate_short_volatility(history_data)
                 
                 return self._calculate_ts_score(
                     market, 
                     reward_json["data"][0], 
                     book_yes, 
                     volatility,
+                    volatility_1h=volatility_1h,
                     book_no=book_no 
                 )
 
@@ -174,7 +176,22 @@ class HoneypotService:
             return 0.01
         
         # 최고가 - 최저가 = 24시간 가격 변동폭
-        return max(prices) - min(prices)    
+        return max(prices) - min(prices)
+
+    def _calculate_short_volatility(self, history):
+        """[추가] 최근 1시간(또는 최신 데이터 2개)의 변동성 계산"""
+        if not history or len(history) < 2:
+            return 0.005 # 기본값
+            
+        # 최신 가격 2개만 추출 (fidelity=60이므로 두 점 사이가 1시간)
+        # history의 마지막 부분이 가장 최신 데이터입니다.
+        recent_prices = [float(item['p']) for item in history[-2:] if 'p' in item]
+        
+        if len(recent_prices) < 2:
+            return 0.005
+            
+        # 1시간 동안의 절대 가격 변화량
+        return abs(recent_prices[-1] - recent_prices[-2])
 
     def _get_effective_depth(self, book_data, spread_usd):
         
@@ -220,7 +237,7 @@ class HoneypotService:
 
         return effective_depth_usd, mid_price
 
-    def _calculate_ts_score(self, market, reward_info, book, volatility, book_no=None):
+    def _calculate_ts_score(self, market, reward_info, book, volatility, volatility_1h=0.005, book_no=None):
         now = datetime.now(timezone.utc)
         
         # 1. 보상 데이터 추출
@@ -300,6 +317,7 @@ class HoneypotService:
             "depth_no": round(depth_no, 2),
             "total_depth": round(total_depth, 2),
             "volatility": round(volatility, 4),
+            "volatility_1h": round(volatility_1h, 4),
             "min_size": min_size,        # <--- 이 줄을 추가하세요!
             "metrics": {
                 "yield": round(yield_score, 2),
@@ -374,4 +392,5 @@ class HoneypotService:
                     vol = self._calculate_volatility(await h_res.json())
                     return self._calculate_ts_score(market, reward_data[0], await b_res.json(), vol)
             except: pass
+
             return None            
