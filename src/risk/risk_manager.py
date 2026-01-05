@@ -16,6 +16,27 @@ class RiskManager:
         self.inventory_manager = inventory_manager
         self.is_halted = False  # Circuit Breaker 작동 여부
 
+    def validate_obi(self, orderbook: dict) -> tuple[bool, str]:
+        """[추가] OBI(Order Book Imbalance)를 분석하여 가격 급변동 전조를 감지합니다."""
+        bids = orderbook.get("bids", [])
+        asks = orderbook.get("asks", [])
+        
+        if not bids or not asks: return True, "OK"
+
+        # 최상단 호가 물량 합산
+        bid_vol = sum(float(b['size']) for b in bids[:3])
+        ask_vol = sum(float(a['size']) for a in asks[:3])
+        
+        if (bid_vol + ask_vol) == 0: return True, "OK"
+        
+        obi = (bid_vol - ask_vol) / (bid_vol + ask_vol)
+        
+        # OBI가 극단적(0.8 이상)이면 주문을 일시 차단하여 보호합니다.
+        if obi > 0.8: return False, "OBI_HIGH_UPWARD_RISK"
+        if obi < -0.8: return False, "OBI_HIGH_DOWNWARD_RISK"
+        
+        return True, "OK"
+
     # --- 1단 방어: Auto-Hedge (델타 뉴트럴 계산) ---
     def calculate_hedge_need(self) -> float:
         """
@@ -69,8 +90,14 @@ class RiskManager:
         # 1. 시스템 중단 여부 확인
         if self.is_halted:
             return False, "TRADING_HALTED_BY_CIRCUIT_BREAKER"
+
+        # 2. 외부 시장 위험 (OBI 체크) - [추가 및 순서 조정]
+        # 내 상태와 상관없이 시장 자체가 비정상적(한쪽으로 쏠림)이라면 주문을 내지 않는 것이 상책입니다.
+        obi_valid, obi_reason = self.validate_obi(orderbook)
+        if not obi_valid:
+            return False, obi_reason
         
-        # 2. 수량 기반 노출 한도 체크 (기존 USD 대신 Shares 기준)
+        # 3. 수량 기반 노출 한도 체크 (기존 USD 대신 Shares 기준)
         if side == "BUY":
             if not self.inventory_manager.can_quote_yes(size_shares):
                 return False, "MAX_SHARE_EXPOSURE_EXCEEDED"
@@ -78,7 +105,7 @@ class RiskManager:
             if not self.inventory_manager.can_quote_no(size_shares):
                 return False, "MAX_SHARE_EXPOSURE_EXCEEDED"
 
-        # 3. 인벤토리 상태 확인
+        # 4. 인벤토리 상태 확인
         status = self.get_inventory_status()
         if status == "EMERGENCY":
             return False, "INVENTORY_CRITICAL_SKEW"
@@ -89,4 +116,5 @@ class RiskManager:
         """중단된 봇을 다시 수동으로 재개합니다."""
         self.is_halted = False
         logger.info("system_trading_resumed_by_user")
+
 
