@@ -26,16 +26,10 @@ from src.services import AutoRedeem, start_metrics_server
 logging.basicConfig(level=logging.INFO)
 logger = structlog.get_logger(__name__)
 
-#1. 초기화
-
 class MarketMakerBot:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.running = False
-        self.honeypot_service = HoneypotService(settings) # 서비스 추가
-        self.ws_client = PolymarketWebSocketClient(settings)
-        self.order_signer = OrderSigner(settings.private_key)
-        self.order_executor = OrderExecutor(settings, self.order_signer)
         
         self.inventory_manager = InventoryManager(
             settings.max_exposure_usd,
@@ -44,20 +38,22 @@ class MarketMakerBot:
         )
         self.risk_manager = RiskManager(settings, self.inventory_manager)
         self.quote_engine = QuoteEngine(settings, self.inventory_manager)
-        
+        self.honeypot_service = HoneypotService(settings) # 서비스 추가
+        self.ws_client = PolymarketWebSocketClient(settings)
+        self.order_signer = OrderSigner(settings.private_key)
+        self.order_executor = OrderExecutor(settings, self.order_signer)
         self.auto_redeem = AutoRedeem(settings)
         
         self.current_orderbook: dict[str, Any] = {}
         self.open_orders: dict[str, dict[str, Any]] = {}
         self.last_quote_time = 0.0
+        self.trade_timestamps = []
 
         self.current_market_id = settings.market_id
         self.yes_token_id = ""
         self.no_token_id = ""
         self.spread_cents = 3
         self.min_size = 20.0
-
-        self.trade_timestamps = []
     
     #2. 마켓 탐색
 
@@ -108,33 +104,26 @@ class MarketMakerBot:
             asyncio.create_task(self.check_and_defend_orders())     
             
     def _handle_trade_update(self, data: dict[str, Any]):
-        """웹소켓 체결 업데이트 및 독성 흐름 대응"""
         side, size, token_id = data.get("side"), float(data.get("size", 0)), data.get("token_id")
         actual_price, order_id = float(data.get("price", 0)), data.get("order_id")
         
-        # 1. 인벤토리 실시간 업데이트 및 사후 방어 가동
+        # 1. 인벤토리 즉시 업데이트
         yes_delta = size if token_id == self.yes_token_id and side == "BUY" else (-size if token_id == self.yes_token_id else 0)
         no_delta = size if token_id == self.no_token_id and side == "BUY" else (-size if token_id == self.no_token_id else 0)
-        
         self.inventory_manager.update_inventory(yes_delta, no_delta)
-        asyncio.create_task(self._defend_after_trade(actual_price, order_id))
 
-        # 2. [독성 흐름 감지] 10초 내 5회 이상 체결 시 공격으로 간주
+        # 2. 독성 흐름(Toxic Flow) 감지
         now = time.time()
         self.trade_timestamps.append(now)
         self.trade_timestamps = [t for t in self.trade_timestamps if now - t < 10]
         
-        if len(self.trade_timestamps) >= 5:
-            logger.warning("🚨 TOXIC_FLOW_DETECTED", count=len(self.trade_timestamps))
-            
-            # 봇 가동 중단 (추가 주문 방지)
-            self.risk_manager.is_halted = True
-            
-            # [핵심] 거래소의 모든 주문을 즉시 취소하여 추가 피해 차단
-            asyncio.create_task(self._emergency_cancel_all())
-            
-            # 30초 쿨다운 후 재개
-            asyncio.create_task(self._cool_down_and_resume(30))
+        if len(self.trade_timestamps) >= 5: # 10초 내 5회 이상 체결
+            # 즉시 주문 취소 방어 가동
+            asyncio.create_task(self.handle_emergency("TOXIC_FLOW_DETECTED", exit_position=False))
+            return
+
+        # 3. 사후 방어 로직 (Slippage 체크 및 Auto-Hedge)
+        asyncio.create_task(self._defend_after_trade(actual_price, order_id))
 
     #4. 리스크 관리  
 
@@ -506,6 +495,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
 
         pass
+
 
 
 
