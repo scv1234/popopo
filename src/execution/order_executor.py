@@ -226,4 +226,3 @@ class OrderExecutor:
         """HTTP 클라이언트를 종료합니다."""
         await self.client.aclose()
 
-

@@ -1,4 +1,4 @@
-# src/api_server.py uvicorn src.api_server:app --reload --port 8000
+# src/api_server.py
 import asyncio
 import sys
 import sqlite3
@@ -9,7 +9,7 @@ if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware  # [추가 1]
+from fastapi.middleware.cors import CORSMiddleware
 from src.main import MarketMakerBot
 from src.config import get_settings
 from pydantic import BaseModel
@@ -38,18 +38,17 @@ app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 모든 출처 허용 (개발용)
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# [수정] 주문 요청 모델: 'shares' 대신 'amount'로 명칭 변경 (투자 금액 의미 강조)
 class OrderRequest(BaseModel):
     market_id: str
     amount: float
-    yes_token_id: str  # 추가
-    no_token_id: str   # 추가
+    yes_token_id: str
+    no_token_id: str
 
 @app.get("/honey-pots")
 def get_honey_pots():
@@ -60,7 +59,6 @@ def get_honey_pots():
         cursor.execute('CREATE TABLE IF NOT EXISTS honeypots (id TEXT PRIMARY KEY, data TEXT, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)')
         cursor.execute('SELECT data FROM honeypots')
         rows = cursor.fetchall()
-        #
         return [json.loads(row[0]) for row in rows]
     except Exception:
         return []
@@ -75,11 +73,12 @@ async def get_status():
     best_ask = float(bot.current_orderbook.get("best_ask", 1))
     mid_price = bot.quote_engine.calculate_mid_price(best_bid, best_ask)
     
-    # [중요] 리워드 세이프티 마진 계산 (90% 지점)
+    # 리워드 세이프티 마진 계산
     current_spread = getattr(bot, 'spread_cents', 3)
 
     return {
         "is_halted": bot.risk_manager.is_halted,
+        "is_locked": bot.state_lock.locked(), # [추가] 마켓 전환 중(Lock) 여부
         "inventory": {
             "yes": bot.inventory_manager.inventory.yes_position,
             "no": bot.inventory_manager.inventory.no_position,
@@ -87,7 +86,8 @@ async def get_status():
             "skew": bot.inventory_manager.inventory.get_skew()
         },
         "market": {
-            "market_id": bot.settings.market_id,
+            # [수정] settings.market_id 대신 현재 활성 마켓 ID 사용
+            "market_id": bot.current_market_id, 
             "mid_price": round(mid_price, 4),
             "margin_usd": round(current_spread * 0.9 / 100.0, 4),
             "best_bid": best_bid,
@@ -102,7 +102,6 @@ async def place_semi_auto_order(req: OrderRequest):
     if bot.risk_manager.is_halted:
         raise HTTPException(status_code=400, detail="시스템이 중단되었습니다. 먼저 리셋 버튼을 눌러주세요.")
     
-    # [수정] 봇의 execute_manual_safety_order 호출 (amount_usd 전달)
     success = await bot.execute_manual_safety_order(
         req.market_id, 
         req.amount, 
@@ -114,19 +113,26 @@ async def place_semi_auto_order(req: OrderRequest):
     
     return {"status": "success"}
 
+# [추가] 봇 리셋 엔드포인트
+@app.post("/reset-bot")
+async def reset_bot():
+    """서킷 브레이커로 중단된 봇을 수동으로 재개합니다."""
+    if bot.risk_manager.is_halted:
+        bot.risk_manager.reset_halt()
+        return {"status": "success", "message": "봇이 정상 상태로 재설정되었습니다."}
+    
+    return {"status": "ignored", "message": "봇이 이미 정상 작동 중입니다."}
+
 @app.get("/wallet")
 async def get_wallet():
     """RPC를 통해 실제 지갑의 USDC 및 MATIC 잔고를 조회합니다."""
     try:
-        # Web3 연결
         w3 = Web3(Web3.HTTPProvider(settings.rpc_url))
         address = Web3.to_checksum_address(settings.public_address)
         
-        # 1. MATIC(가스비) 잔고 조회
         native_balance = w3.eth.get_balance(address)
         matic_balance = w3.from_wei(native_balance, 'ether')
         
-        # 2. USDC 잔고 조회
         usdc_contract = w3.eth.contract(address=Web3.to_checksum_address(USDC_ADDRESS), abi=ERC20_ABI)
         raw_balance = usdc_contract.functions.balanceOf(address).call()
         decimals = usdc_contract.functions.decimals().call()
@@ -139,7 +145,6 @@ async def get_wallet():
             "native_token": "Polygon MATIC"
         }
     except Exception as e:
-        # 실패 시 로그 기록 및 기본값 반환
         print(f"❌ 잔고 조회 실패: {e}")
         return {
             "address": settings.public_address,
@@ -152,6 +157,7 @@ async def get_wallet():
 async def get_open_orders():
     """현재 거래소 활성 주문 리스트"""
     orders = []
+    # 봇의 메모리에 있는 주문 목록 반환
     for order_id, details in bot.open_orders.items():
         orders.append({
             "order_id": order_id,

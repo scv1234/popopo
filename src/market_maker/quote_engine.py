@@ -127,4 +127,3 @@ class QuoteEngine:
         return time_to_close_hours < 1.0
 
 
-
