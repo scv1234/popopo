@@ -4,7 +4,6 @@ from typing import Any
 from eth_account import Account
 from eth_account.messages import encode_typed_data
 import structlog
-import json
 
 logger = structlog.get_logger(__name__)
 
@@ -13,19 +12,15 @@ class OrderSigner:
         self.account = Account.from_key(private_key)
 
     def get_address(self) -> str:
-        # [핵심] 원래의 체크섬 주소 반환 (대소문자 섞임)
+        """체크섬이 적용된 지갑 주소 반환"""
         return self.account.address
 
     def sign_clob_auth_message(self, timestamp: int, nonce: int = 0) -> str:
-        """[수정] API 키 발급용 EIP-712 서명 (Checksum Address 사용)"""
+        """
+        [공식 문서] API 키 생성을 위한 EIP-712 서명
+        https://docs.polymarket.com/developers/CLOB/authentication#python-2
+        """
         try:
-            # .lower() 제거 -> 원래 주소 사용
-            checksum_address = self.account.address
-            
-            logger.info(f"DEBUG_SIGNER: Signing Address: {checksum_address}")
-            logger.info(f"DEBUG_SIGNER: Timestamp: {timestamp}, Nonce: {nonce}")
-
-            # EIP-712 데이터 구성
             data = {
                 "types": {
                     "EIP712Domain": [
@@ -44,35 +39,25 @@ class OrderSigner:
                 "domain": {
                     "name": "ClobAuthDomain",
                     "version": "1",
-                    "chainId": 137,
+                    "chainId": 137, # Polygon Mainnet
                 },
                 "message": {
-                    "address": checksum_address, # [중요] 체크섬 주소 사용
+                    "address": self.account.address,
                     "timestamp": str(timestamp),
-                    "nonce": int(nonce),
+                    "nonce": nonce,
                     "message": "This message attests that I control the given wallet"
                 }
             }
             
-            # 디버깅용 출력
-            # print(f"\n[DEBUG_SIGNER] Full Data Structure:\n{json.dumps(data, default=str, indent=2)}\n")
-            
             signable_message = encode_typed_data(full_message=data)
             signed_message = self.account.sign_message(signable_message)
-            
-            # 0x 접두어 처리
-            sig = signed_message.signature.hex()
-            if not sig.startswith("0x"):
-                sig = "0x" + sig
-            
-            return sig
+            return signed_message.signature.hex()
             
         except Exception as e:
             logger.error("clob_auth_signing_failed", error=str(e))
             raise
 
     def sign_order(self, order_data: dict[str, Any]) -> str:
-        """주문용 EIP-712 서명 (기존 로직 유지 + 0x 접두어 확인)"""
         try:
             data = {
                 "types": {
@@ -124,10 +109,7 @@ class OrderSigner:
             signed_message = self.account.sign_message(signable_message)
             
             sig = signed_message.signature.hex()
-            if not sig.startswith("0x"):
-                sig = "0x" + sig
-            return sig
-            
+            return sig if sig.startswith("0x") else "0x" + sig
         except Exception as e:
             logger.error("order_signing_failed", error=str(e))
             raise
