@@ -1,4 +1,5 @@
 # src/main.py
+# uvicorn src.api_server:app --reload --port 8000
 from __future__ import annotations
 
 import asyncio
