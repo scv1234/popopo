@@ -289,7 +289,7 @@ class MarketMakerBot:
                 if order.get("token_id") != token_id: continue
                 
                 price_diff = abs(mid_price - float(order.get("price", 0)))
-                is_risky = price_diff < (spread_usd * 0.1)
+                is_risky = price_diff < (spread_usd * 0.3)
                 is_invalid = price_diff > spread_usd
                 
                 if is_risky or is_invalid:
@@ -363,7 +363,7 @@ class MarketMakerBot:
             # 2. 거래소 주문 취소 실행
             # 리스크 상황이므로 수동 주문 여부와 상관없이 해당 마켓의 모든 주문을 거두어들입니다.
             if self.current_market_id:
-                await self.order_executor.cancel_all_orders(self.settings.market_id)
+            await self.order_executor.cancel_all_orders(self.current_market_id)
             
             # 3. [핵심 추가] 로컬 메모리 상태 완전 초기화
             # 오픈 주문 목록과 수동 주문 추적 목록을 모두 비웁니다.

@@ -30,12 +30,17 @@ class QuoteEngine:
             return 0.0
         return (best_bid + best_ask) / 2.0
 
-    def round_to_tick(self, price: float, tick_size: float) -> float:
-        """시장의 최소 단위(tick_size)에 맞춰 가격을 반올림합니다."""
+    def ceil_to_tick(self, price: float, tick_size: float) -> float:
+        """
+        보상 범위 내에서 가장 먼 가격(최외곽 틱)을 찾기 위해 올림 처리를 합니다.
+        부동소수점 오차를 방지하기 위해 정규화 과정을 거칩니다.
+        """
         if tick_size <= 0: return round(price, 2)
-        # 예: tick_size가 0.01이면 소수점 2자리, 0.001이면 3자리로 계산
         precision = int(-math.log10(tick_size))
-        return round(math.floor(price / tick_size) * tick_size, precision)    
+        
+        # 8자리 반올림으로 미세 오차 제거 후 틱 단위 올림(ceil)
+        normalized_price = round(price / tick_size, 8)
+        return round(math.ceil(normalized_price) * tick_size, precision)   
 
     def generate_quotes(
         self, 
@@ -72,11 +77,8 @@ class QuoteEngine:
             return (None, None)
 
         # 3. 변동성에 따른 스프레드 배율 결정
-        if volatility_1h < 0.045:
-            # 안정적인 시장에서는 기본 스프레드(1.0배) 유지
-            volatility_multiplier = 1.0
-        else:
-            # 고변동성 시장에서는 위험 회피를 위해 스프레드를 동적으로 확대 (최대 3.0배)
+        volatility_multiplier = 1.0
+        if volatility_1h >= 0.045:
             volatility_multiplier = max(1.0, min(3.0, 1 + (volatility_1h * 100)))
             logger.warning("🚨 HIGH_VOLATILITY_DYNAMIC_DEFENSE", 
                            vol=round(volatility_1h, 4), 
@@ -84,22 +86,20 @@ class QuoteEngine:
 
         # 최종 스프레드 및 리워드 획득을 위한 90% 마진 계산
         dynamic_spread_usd = (spread_cents * volatility_multiplier) / 100.0
-        margin_usd = dynamic_spread_usd * 0.9
+        margin_usd = dynamic_spread_usd
 
         # 4. 가격 스큐 (Price Skewing) 유지
         inventory_diff = self.inventory_manager.inventory.net_exposure_shares
         skew_adjustment = (inventory_diff / 1000) * 0.005
         
-        # 보상 범위 또는 방어 범위를 활용하기 위한 90% 마진 적용
-        margin_usd = dynamic_spread_usd * 0.9
-        
         # 스큐 적용 중간가 산출
-        yes_skewed_mid = yes_mid - skew_adjustment
-        no_skewed_mid = no_mid + skew_adjustment
-        
-        # YES/NO 주문 가격 산출
-        yes_bid_price = self.round_to_tick(yes_skewed_mid - margin_usd, tick_size)
-        no_bid_price = self.round_to_tick(no_skewed_mid - margin_usd, tick_size)
+        # YES: 중간가 - 스큐 - 스프레드 지점의 올림값
+        yes_target = yes_mid - skew_adjustment - margin_usd
+        yes_bid_price = self.ceil_to_tick(yes_target, tick_size)
+
+        # NO: 중간가 + 스큐 - 스프레드 지점의 올림값
+        no_target = no_mid + skew_adjustment - margin_usd
+        no_bid_price = self.ceil_to_tick(no_target, tick_size)
 
         # 5. 최종 Quote 생성
         yes_shares = self.inventory_manager.get_quote_size_yes(final_shares)

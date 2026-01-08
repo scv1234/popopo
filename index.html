@@ -2,296 +2,161 @@
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
-    <title>Polymarket Pro Terminal</title>
+    <title>Polymarket Pro - Interactive Optimizer</title>
     <style>
         :root { 
-            --bg: #0d1117; 
-            --panel: #161b22; 
-            --border: #30363d; 
-            --accent: #238636; 
-            --accent-hover: #2ea043;
-            --text: #c9d1d9; 
-            --text-muted: #8b949e;
-            --red: #da3633; 
-            --red-hover: #f85149;
-            --gold: #e2b93d; 
-            --blue: #58a6ff;
-            --gray: #6e7681;
+            --bg: #0d1117; --panel: #161b22; --border: #30363d; 
+            --accent: #238636; --text: #c9d1d9; --text-muted: #8b949e;
+            --red: #da3633; --gold: #e2b93d; --blue: #58a6ff;
         }
         body { 
-            background-color: var(--bg); 
-            color: var(--text); 
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
-            margin: 0; 
-            padding: 20px; 
-            font-size: 14px;
+            background: var(--bg); color: var(--text); font-family: -apple-system, sans-serif; 
+            margin: 0; padding: 10px; font-size: 13px; height: 100vh; width: 100vw; box-sizing: border-box; overflow: hidden; 
         }
+        .main-layout { display: grid; grid-template-columns: 280px 1fr 1.6fr; gap: 10px; height: calc(100vh - 20px); min-height: 0; }
+        .column { display: flex; flex-direction: column; gap: 10px; height: 100%; min-height: 0; }
+        .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px; display: flex; flex-direction: column; min-height: 0; }
+        .panel-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; border-bottom: 1px solid var(--border); padding-bottom: 6px; flex-shrink: 0; }
+        h2 { margin: 0; font-size: 11px; color: var(--blue); text-transform: uppercase; }
+        .content-scroll { overflow-y: auto; flex-grow: 1; min-height: 0; }
         
-        .container { 
-            display: grid; 
-            grid-template-columns: 280px 1fr; 
-            gap: 20px; 
-            max-width: 1400px; 
-            margin: 0 auto; 
+        table { width: 100%; border-collapse: collapse; table-layout: fixed; } 
+        th { text-align: center; color: var(--text-muted); padding: 8px 2px; font-size: 10px; border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--panel); z-index: 10; }
+        td { padding: 8px 2px; border-bottom: 1px solid #21262d; font-size: 11px; vertical-align: middle; text-align: center; }
+        
+        /* 마켓 타이틀 스타일 */
+        .title-cell { text-align: left; overflow: hidden; }
+        .title-container { display: flex; align-items: center; width: 100%; }
+        .title-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
+
+        /* [핵심] 반짝임 애니메이션 효과 */
+        @keyframes sparkle-glow {
+            0% { background: rgba(35, 134, 54, 0.1); box-shadow: inset 0 0 5px var(--accent); }
+            50% { background: rgba(226, 185, 61, 0.2); box-shadow: inset 0 0 15px var(--gold); }
+            100% { background: rgba(35, 134, 54, 0.1); box-shadow: inset 0 0 5px var(--accent); }
+        }
+        .highlight-opt {
+            animation: sparkle-glow 2s infinite ease-in-out;
+            border: 1px solid var(--gold) !important;
+            z-index: 5;
         }
 
-        .panel { 
-            background: var(--panel); 
-            border: 1px solid var(--border); 
-            border-radius: 8px; 
-            padding: 20px; 
-            margin-bottom: 20px; 
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-        }
+        .stat-box { background: #0d1117; padding: 12px; border-radius: 4px; text-align: center; margin-bottom: 6px; }
+        input, button { border-radius: 4px; padding: 8px; font-size: 12px; box-sizing: border-box; }
+        input { background: #0d1117; border: 1px solid var(--border); color: white; width: 100%; margin-bottom: 8px; }
+        button { background: var(--accent); color: white; border: none; cursor: pointer; width: 100%; font-weight: bold; }
         
-        .panel-header { 
-            display: flex; 
-            justify-content: space-between; 
-            align-items: center; 
-            margin-bottom: 15px;
-            padding-bottom: 10px;
-            border-bottom: 1px solid var(--border);
-        }
-        
-        h2 { 
-            margin: 0; 
-            font-size: 16px; 
-            font-weight: 600; 
-            color: var(--text); 
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-
-        .status-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
-        .stat-box { background: #21262d; padding: 12px; border-radius: 6px; text-align: center; }
-        .stat-val { font-size: 18px; font-weight: 700; display: block; margin-bottom: 4px; color: var(--text); }
-        .stat-label { font-size: 12px; color: var(--text-muted); }
-
-        label { display: block; font-size: 12px; color: var(--text-muted); margin-bottom: 6px; margin-top: 12px; }
-        input[type="text"], input[type="number"] { 
-            background: #0d1117; 
-            border: 1px solid var(--border); 
-            color: var(--text); 
-            padding: 10px; 
-            width: 100%; 
-            border-radius: 6px; 
-            box-sizing: border-box; 
-            font-family: 'Consolas', monospace;
-        }
-        input:focus { outline: none; border-color: var(--blue); }
-        
-        button { 
-            background: var(--accent); 
-            color: white; 
-            border: none; 
-            padding: 12px; 
-            width: 100%; 
-            cursor: pointer; 
-            font-weight: 600; 
-            border-radius: 6px; 
-            margin-top: 10px;
-            transition: background 0.2s;
-        }
-        button:hover { background: var(--accent-hover); }
-        
-        .btn-red { background: var(--red); }
-        .btn-red:hover { background: var(--red-hover); }
-        .btn-gray { background: var(--gray); }
-        .btn-gray:hover { opacity: 0.8; }
-
-        .table-wrapper {
-            max-height: 600px;
-            overflow-y: auto;
-        }
-
-        table { width: 100%; border-collapse: collapse; font-size: 13px; }
-        
-        th { 
-            text-align: left; 
-            color: var(--text-muted); 
-            padding: 12px 8px; 
-            border-bottom: 1px solid var(--border); 
-            font-weight: 500;
-            cursor: pointer;
-            position: sticky;
-            top: 0;
-            background: var(--panel);
-            z-index: 10;
-        }
-        
-        th:hover { color: var(--text); }
-        td { padding: 12px 8px; border-bottom: 1px solid #21262d; vertical-align: middle; }
-        tr:last-child td { border-bottom: none; }
-        tr:hover { background-color: #21262d; cursor: pointer; }
-        
-        .row-selected { background-color: rgba(88, 166, 255, 0.1) !important; }
-
-        .market-cell {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            max-width: 320px;
-        }
-        .market-title-text {
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
-            flex: 1;
-            cursor: pointer;
-        }
-        .market-title-text:hover { color: var(--blue); text-decoration: underline; }
-        .market-icon-link { flex-shrink: 0; text-decoration: none; opacity: 0.7; font-size: 14px; }
-        .market-icon-link:hover { opacity: 1; transform: scale(1.2); }
-
-        .badge { padding: 4px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
-        
+        .logs { font-family: 'Consolas', monospace; font-size: 11px; color: var(--text-muted); white-space: pre-wrap; word-break: break-all; }
+        .link-icon { text-decoration: none; color: var(--blue); font-size: 11px; margin-left: 4px; flex-shrink: 0; }
         .profit-pos { color: #7ee787; font-weight: bold; }
-        .profit-neu { color: var(--text-muted); }
-        
-        .logs { 
-            height: 150px; 
-            overflow-y: auto; 
-            font-family: 'Consolas', monospace; 
-            font-size: 12px; 
-            color: var(--text-muted); 
-            line-height: 1.4;
-            background: #0d1117;
-            padding: 10px;
-            border-radius: 6px;
-            border: 1px solid var(--border);
-        }
 
-        .sim-input-group { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-muted); }
-        .sim-input { 
-            width: 80px !important; 
-            padding: 6px !important; 
-            text-align: right; 
-            border-color: var(--border);
-            margin: 0 !important;
-            height: auto;
-        }
-        
-        ::-webkit-scrollbar { width: 8px; height: 8px; }
-        ::-webkit-scrollbar-track { background: var(--bg); }
-        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
-        ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+        ::-webkit-scrollbar { width: 4px; }
+        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
     </style>
 </head>
 <body>
 
-<div class="container">
-    <div>
-        <div class="panel">
-            <div class="panel-header"><h2>🤖 System Status</h2></div>
-            <div id="bot-status" class="stat-box" style="cursor: default;">Connecting...</div>
-            
-            <div class="status-grid">
-                <div class="stat-box">
-                    <span id="wallet-usdc" class="stat-val">-</span>
-                    <span class="stat-label">USDC Balance</span>
-                </div>
-                <div class="stat-box">
-                    <span id="wallet-matic" class="stat-val">-</span>
-                    <span class="stat-label">MATIC Gas</span>
-                </div>
-            </div>
-            
-            <div style="margin-top: 15px; font-size: 12px; color: var(--text-muted); display: flex; justify-content: space-between;">
-                <span>Skew: <b id="inv-skew" style="color:var(--text)">-</b></span>
-                <span>Net Exposure: <b id="inv-net" style="color:var(--text)">-</b></span>
+<div class="main-layout">
+    <div class="column">
+        <div class="panel" style="flex-shrink: 0;">
+            <div class="panel-header"><h2>🤖 System</h2></div>
+            <div id="bot-status" class="stat-box" style="padding: 5px; font-size: 11px;">Connecting...</div>
+            <div class="stat-box">
+                <small style="color: var(--text-muted); font-size: 10px; display: block;">USDC (RPC Wallet)</small>
+                <div id="wallet-usdc" style="font-weight: bold; color: var(--gold); font-size: 22px;">$0</div>
             </div>
         </div>
-
-        <div class="panel">
+        <div class="panel" style="flex-shrink: 0;">
             <div class="panel-header"><h2>🚀 Quick Trade</h2></div>
-            
-            <label>Target Market ID</label>
-            <input type="text" id="order-market-id" placeholder="Select from list..." readonly style="cursor: not-allowed; opacity: 0.7;">
-            
-            <label>Investment Amount ($)</label>
+            <input type="text" id="order-market-id" readonly placeholder="Click Market Opportunity">
             <input type="number" id="order-amount" value="100">
-            
-            <button onclick="placeOrder()" id="btn-order">Place Buy Order</button>
-
-            <div style="margin-top: 20px; border-top: 1px solid var(--border); padding-top: 10px;">
-                <label>Emergency Controls</label>
-                <button onclick="batchCancelManual()" class="btn-gray">Batch Cancel All Manual Orders</button>
-            </div>
+            <button onclick="placeOrder()">Execute Order</button>
         </div>
-
-        <div class="panel">
-            <div class="panel-header"><h2>📝 Active Orders</h2></div>
-            <div id="open-orders" style="font-size: 13px; min-height: 50px; color: var(--text-muted);">No active orders</div>
+        <div class="panel" style="flex-grow: 1;">
+            <div class="panel-header"><h2>📜 Logs</h2></div>
+            <div class="content-scroll"><div id="logs" class="logs"></div></div>
         </div>
     </div>
 
-    <div>
-        <div class="panel">
-            <div class="panel-header">
-                <h2>🍯 Market Opportunities</h2>
-                <div class="sim-input-group">
-                    <span>Simulation Base: $</span>
-                    <input type="number" id="sim-amount" class="sim-input" value="1000" onchange="updateMarkets()">
-                </div>
+    <div class="column">
+        <div class="panel" style="flex: 0.6;">
+            <div class="panel-header"><h2>⚖️ Optimizer</h2></div>
+            <div style="display:flex; gap:6px; margin-bottom: 8px;">
+                <input type="number" id="opt-budget" value="1000" style="margin:0;">
+                <button onclick="runOptimizer()" style="width:70px;">Analyze</button>
             </div>
-            
-            <div class="table-wrapper">
-                <table>
-                    <thead>
-                        <tr>
-                            <th width="8%" onclick="setSort('score')">Score ▾</th>
-                            <th width="32%">Market Title</th> 
-                            <th width="10%">Min Shares</th>   
-                            <th width="12%">Reward/Day</th>
-                            <th width="12%" onclick="setSort('profit')">Est. Profit ▾</th>
-                            <th width="10%">Depth</th>
-                            <th width="8%">Spread</th>
-                            <th width="8%">Mid</th>
-                        </tr>
-                    </thead>
-                    <tbody id="market-table">
-                        <tr><td colspan="8" style="text-align: center; padding: 40px; color: var(--text-muted);">Loading market data...</td></tr>
-                    </tbody>
-                </table>
+            <div id="optimizer-result" class="content-scroll">
+                <div style="text-align:center; padding-top:20px; color:var(--text-muted);">Ready to analyze.</div>
             </div>
         </div>
+        <div class="panel" style="flex: 0.4;">
+            <div class="panel-header"><h2>📝 Orders</h2><button onclick="batchCancelManual()" style="width:auto; padding: 2px 5px; font-size:10px; background:var(--border);">Cancel All</button></div>
+            <div id="open-orders" class="content-scroll"><div style="text-align:center; padding-top:20px; color:var(--text-muted);">No orders</div></div>
+        </div>
+    </div>
 
-        <div class="panel">
-            <div class="panel-header" style="border-bottom: none; margin-bottom: 5px;">
-                <h2>📜 System Logs</h2>
-                <button onclick="clearLogs()" style="width: auto; padding: 4px 8px; font-size: 11px; margin: 0; background: var(--border);">Clear</button>
+    <div class="column">
+        <div class="panel flex-grow-1">
+            <div class="panel-header"><h2>🍯 Market Opportunities</h2><div style="display:flex; align-items:center; gap:5px;"><small style="font-size:10px; color:var(--text-muted);">Sim:</small><input type="number" id="sim-amount" value="1000" style="width:60px; margin:0; padding:4px; font-size:11px;" onchange="updateMarkets()"></div></div>
+            <div class="content-scroll">
+                <table id="main-market-table">
+                    <thead><tr><th style="width:35px;">Scr</th><th style="width:auto;">Market Title</th><th style="width:40px;">Shr</th><th style="width:45px;">Mid</th><th style="width:60px;">Depth</th><th style="width:40px;">Sprd</th><th style="width:60px;">Est.R</th><th style="width:55px;">Rwd/d</th></tr></thead>
+                    <tbody id="market-table-body"></tbody>
+                </table>
             </div>
-            <div id="logs" class="logs"></div>
         </div>
     </div>
 </div>
 
 <script>
     const API_URL = "http://localhost:8000";
-    let sortKey = 'score';
-    let selectedId = null;
-    let marketDataMap = {};
+    let marketData = [];
 
-    async function updateStatus() {
-        try {
-            const res = await fetch(`${API_URL}/status`);
-            const data = await res.json();
-            const statusBox = document.getElementById('bot-status');
-            if (data.is_halted) {
-                statusBox.textContent = "🚨 HALTED (Click to Reset)";
-                statusBox.style.background = "var(--red)";
-                statusBox.onclick = resetHalt;
-                statusBox.style.cursor = "pointer";
-            } else {
-                statusBox.textContent = "🟢 SYSTEM ONLINE";
-                statusBox.style.background = "var(--accent)";
-                statusBox.onclick = null;
-                statusBox.style.cursor = "default";
-            }
-            document.getElementById('inv-skew').textContent = data.inventory.skew.toFixed(2);
-            document.getElementById('inv-net').textContent = Math.round(data.inventory.net_shares);
-        } catch (e) {}
+    // [핵심] 옵티마이저 실행 후 마켓 리스트에 하이라이트 적용
+    function runOptimizer() {
+        const budget = parseFloat(document.getElementById('opt-budget').value) || 0;
+        const resultDiv = document.getElementById('optimizer-result');
+        if (marketData.length === 0) return;
+
+        let allocations = {}; marketData.forEach(m => allocations[m.market_id] = 0);
+        let remaining = budget;
+        const step = 10;
+
+        while (remaining >= step) {
+            let bestM = null;
+            let maxRiskAdjustedROI = -1;
+
+            marketData.forEach(m => {
+                const x = allocations[m.market_id];
+                const minUSD = m.min_size * (m.mid_price || 0.5); 
+                const currentRev = (x < minUSD) ? 0 : (m.reward * (x / (m.total_depth + x)));
+                const nextX = x + step;
+                const nextRev = (nextX < minUSD) ? 0 : (m.reward * (nextX / (m.total_depth + nextX)));
+                const efficiency = ((nextRev - currentRev) / step) * Math.pow(m.score / 10, 2);
+                if (efficiency > maxRiskAdjustedROI) { maxRiskAdjustedROI = efficiency; bestM = m; }
+            });
+
+            if (bestM && maxRiskAdjustedROI > 0) { allocations[bestM.market_id] += step; remaining -= step; } else break;
+        }
+
+        // 1. 기존 하이라이트 제거
+        document.querySelectorAll('tr').forEach(tr => tr.classList.remove('highlight-opt'));
+
+        let html = '<table><thead><tr><th style="text-align:left;">Market</th><th>Score</th><th>Alloc</th><th>Yield/d</th></tr></thead><tbody>';
+        const activeAllocations = Object.entries(allocations).filter(([_, a]) => a > 0).sort((a, b) => b[1] - a[1]);
+        
+        if (activeAllocations.length === 0) { resultDiv.innerHTML = '<div style="text-align:center; padding:20px; color:var(--red);">N/A</div>'; return; }
+
+        activeAllocations.forEach(([id, amt]) => {
+            const m = marketData.find(md => md.market_id === id);
+            const yieldVal = m.reward * (amt / (m.total_depth + amt));
+            html += `<tr><td class="title-cell"><div class="title-container"><span class="title-text">${m.title}</span></div></td><td>${m.score.toFixed(1)}</td><td style="color:var(--gold); font-weight:bold;">$${amt}</td><td style="color:var(--accent); font-weight:bold;">$${yieldVal.toFixed(2)}</td></tr>`;
+            
+            // 2. [추가] 메인 테이블에서 해당 마켓 ID를 가진 tr 찾아서 클래스 추가
+            const targetRow = document.querySelector(`tr[data-market-id="${id}"]`);
+            if (targetRow) targetRow.classList.add('highlight-opt');
+        });
+        resultDiv.innerHTML = html + '</tbody></table>';
     }
 
     async function updateWallet() {
@@ -299,177 +164,46 @@
             const res = await fetch(`${API_URL}/wallet`);
             const data = await res.json();
             document.getElementById('wallet-usdc').textContent = `$${Math.floor(data.usdc_balance).toLocaleString()}`;
-            document.getElementById('wallet-matic').textContent = data.matic_balance.toFixed(3);
         } catch (e) {}
     }
 
     async function updateMarkets() {
         try {
             const res = await fetch(`${API_URL}/honey-pots`);
-            const data = await res.json();
-            const tbody = document.getElementById('market-table');
-            marketDataMap = {};
-            data.forEach(m => { marketDataMap[m.market_id] = m; });
-            
-            if (data.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; padding: 30px; color: var(--text-muted);">No opportunities found.</td></tr>';
-                return;
-            }
-
+            marketData = await res.json();
             const simAmt = parseFloat(document.getElementById('sim-amount').value) || 1000;
-            data.forEach(m => {
-                let totalPool = m.total_depth + simAmt;
-                m.estProfit = (simAmt / totalPool) * m.reward;
-            });
-
-            data.sort((a,b) => {
-                if(sortKey === 'profit') return b.estProfit - a.estProfit;
-                return b.score - a.score;
-            });
-
-            let html = '';
-            data.forEach(m => {
-                const isSelected = (m.market_id === selectedId) ? 'row-selected' : '';
-                const profitClass = m.estProfit > 10 ? 'profit-pos' : 'profit-neu';
-                
-                html += `<tr onclick="selectMarket('${m.market_id}')" class="${isSelected}">
-                    <td style="color:var(--gold); font-weight:bold;">${m.score.toFixed(1)}</td>
-                    <td>
-                        <div style="display: flex; align-items: center; gap: 8px;">
-                            <div style="font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width: 280px;" title="${m.title}">${m.title}</div>
-                            <a href="https://polymarket.com/event/${m.slug}" target="_blank" onclick="event.stopPropagation()" style="text-decoration: none; color: var(--blue); font-size: 14px;">🔗</a>
-                        </div>
-                    </td>
-                    <td style="color:var(--blue); font-weight:500;">${m.min_size}</td> 
-                    <td>$${m.reward.toLocaleString()}</td>
-                    <td class="${profitClass}">$${m.estProfit.toFixed(2)}</td>
-                    <td style="color:var(--text-muted)">$${m.total_depth.toLocaleString()}</td>
-                    <td><span class="badge badge-blue">${m.spread_cents}¢</span></td>
-                    <td style="font-family:Consolas">${m.mid_yes.toFixed(3)}</td>
-                </tr>`;
-            });
-            tbody.innerHTML = html;
-        } catch (e) {}
-    }
-
-    async function updateOrdersAndLogs() {
-        try {
-            const res = await fetch(`${API_URL}/open-orders`);
-            const orders = await res.json();
-            const div = document.getElementById('open-orders');
-            if (orders.length === 0) {
-                div.innerHTML = '<div style="text-align:center; padding:15px; color:var(--text-muted);">No active orders</div>';
-            } else {
-                div.innerHTML = orders.map(o => `
-                    <div style="border-bottom:1px solid #30363d; padding:12px 0; display:flex; flex-direction:column; gap:5px;">
-                        <div style="display:flex; justify-content:space-between; align-items:center;">
-                            <div>
-                                <span class="badge" style="background:${o.side==='BUY'?'rgba(35,134,54,0.2)':'rgba(218,54,51,0.2)'}; color:${o.side==='BUY'?'#7ee787':'#f85149'}">${o.side}</span>
-                                <b style="color:var(--gold); margin-left:5px;">${o.outcome}</b>
-                                <span style="font-weight:bold; margin-left:5px;">${parseFloat(o.size).toFixed(0)}</span>
-                            </div>
-                            <button onclick="cancelById('${o.order_id}')" style="width:auto; margin:0; padding:4px 8px; font-size:11px; background:var(--red); height:24px;">Cancel</button>
-                        </div>
-                        <div style="font-size:11px; color:var(--text-muted); display:flex; justify-content:space-between;">
-                            <span>MKT: ${o.market.substring(0,12)}...</span>
-                            <span>Price: ${o.price}</span>
-                        </div>
-                    </div>
-                `).join('');
-            }
-
-            // [핵심 수정] 중요 이벤트만 필터링하여 로그 표시
-            const logRes = await fetch(`${API_URL}/logs`);
-            const logs = await logRes.json();
-            const logDiv = document.getElementById('logs');
             
-            const filteredLogs = logs.filter(line => {
-                const upper = line.toUpperCase();
-                return upper.includes("EXECUTED") || 
-                       upper.includes("FAILED") || 
-                       upper.includes("BLOCKED") || 
-                       upper.includes("UNSTABLE") || 
-                       upper.includes("VOLATILITY") || 
-                       upper.includes("SPREAD") || 
-                       upper.includes("EMERGENCY") || 
-                       upper.includes("DEFENSIVE") || 
-                       upper.includes("CIRCUIT");
-            });
-
-            const recentLogs = filteredLogs.slice(-50);
-            if (logDiv.dataset.lastLog !== JSON.stringify(recentLogs)) {
-                logDiv.innerHTML = recentLogs.map(line => `<div>${line}</div>`).join('');
-                logDiv.scrollTop = logDiv.scrollHeight;
-                logDiv.dataset.lastLog = JSON.stringify(recentLogs);
-            }
-        } catch (e) {}
+            // [수정] data-market-id 속성을 추가하여 나중에 찾기 쉽게 함
+            document.getElementById('market-table-body').innerHTML = marketData.map(m => `
+                <tr data-market-id="${m.market_id}" onclick="selectMarket('${m.market_id}')" style="cursor:pointer;">
+                    <td style="color:var(--gold); font-weight:bold;">${m.score.toFixed(1)}</td>
+                    <td class="title-cell"><div class="title-container"><span class="title-text" title="${m.title}">${m.title}</span><a href="https://polymarket.com/event/${m.slug}" target="_blank" class="link-icon" onclick="event.stopPropagation()">🔗</a></div></td>
+                    <td style="color:var(--blue); font-weight:500;">${m.min_size}</td>
+                    <td style="font-family:monospace">${m.mid_price ? m.mid_price.toFixed(3) : '0.500'}</td>
+                    <td style="color:var(--text-muted)">$${Math.round(m.total_depth).toLocaleString()}</td>
+                    <td>${m.spread_cents}¢</td>
+                    <td class="profit-pos">$${(m.reward * (simAmt / (m.total_depth + simAmt))).toFixed(2)}</td>
+                    <td>$${m.reward}</td>
+                </tr>`).join('');
+        } catch(e){}
     }
 
-    function selectMarket(id) {
-        selectedId = id;
-        document.getElementById('order-market-id').value = id;
-        updateMarkets();
-        const btn = document.getElementById('btn-order');
-        btn.textContent = "Ready to Buy";
-        setTimeout(() => btn.textContent = "Place Buy Order", 1000);
-    }
+    // 나머지 보조 함수들 (updateStatus, updateOrders, updateLogs, placeOrder 등)
+    async function updateStatus() { try { const res = await fetch(`${API_URL}/status`); const d = await res.json(); const s = document.getElementById('bot-status'); s.textContent = d.is_halted ? "🚨 HALTED" : "🟢 ONLINE"; s.style.background = d.is_halted ? "var(--red)" : "var(--accent)"; } catch(e){} }
+    async function updateOrders() { try { const res = await fetch(`${API_URL}/open-orders`); const grouped = await res.json(); const div = document.getElementById('open-orders'); if (Object.keys(grouped).length === 0) { div.innerHTML = '<div style="text-align:center; padding:20px; color:var(--text-muted);">No orders</div>'; return; } div.innerHTML = Object.entries(grouped).map(([mid, outcomes]) => `<div class="order-group"><div style="font-size:10px; color:var(--blue); border-bottom:1px solid var(--border); padding-bottom:2px; word-break:break-all; text-align:left;">${mid}</div><div class="split"><div><b style="color:#7ee787; font-size:10px;">YES</b>${renderOrders(outcomes.YES)}</div><div><b style="color:#f85149; font-size:10px;">NO</b>${renderOrders(outcomes.NO)}</div></div></div>`).join(''); } catch(e){} }
+    function renderOrders(orders) { if (!orders || orders.length === 0) return '<div style="font-size:10px; opacity:0.3; text-align:center;">-</div>'; return orders.map(o => `<div style="display:flex; justify-content:space-between; align-items:center; background:#0d1117; margin-top:2px; padding:2px; border-radius:3px; font-size:11px;"><span>${o.price}</span><button class="btn-cancel" onclick="cancelById('${o.order_id}')" style="background:var(--red); width:auto; height:18px; padding:0 4px; font-size:9px; color:white; border:none; border-radius:3px; cursor:pointer;">X</button></div>`).join(''); }
+    async function updateLogs() { try { const res = await fetch(`${API_URL}/logs`); const logs = await res.json(); const logDiv = document.getElementById('logs'); logDiv.innerHTML = logs.map(l => `<div>${l}</div>`).join(''); logDiv.scrollTop = logDiv.scrollHeight; } catch(e){} }
+    function selectMarket(id) { document.getElementById('order-market-id').value = id; }
+    async function cancelById(id) { await fetch(`${API_URL}/cancel-order/${id}`, {method:'POST'}); updateOrders(); }
+    async function batchCancelManual() { await fetch(`${API_URL}/batch-cancel-manual`, {method:'POST'}); updateOrders(); }
+    async function placeOrder() { const id = document.getElementById('order-market-id').value; const amt = parseFloat(document.getElementById('order-amount').value); if(!id) return alert("Select market!"); const m = marketData.find(md => md.market_id === id); await fetch(`${API_URL}/place-semi-auto-order`, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ market_id: id, amount: amt, yes_token_id: m.yes_token_id, no_token_id: m.no_token_id }) }); updateOrders(); }
 
-    async function placeOrder() {
-        const id = document.getElementById('order-market-id').value;
-        const amt = parseFloat(document.getElementById('order-amount').value);
-        if(!id) return alert("Please select a market.");
-        const marketInfo = marketDataMap[id];
-        if(!confirm(`Confirm Order?\nMarket: ${id}\nAmount: $${amt}`)) return;
-        const btn = document.getElementById('btn-order');
-        btn.textContent = "Processing..."; btn.disabled = true;
-        try {
-            const res = await fetch(`${API_URL}/place-semi-auto-order`, {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ 
-                    market_id: id, amount: amt,
-                    yes_token_id: marketInfo.yes_token_id, no_token_id: marketInfo.no_token_id
-                })
-            });
-            if(res.ok) {
-                btn.style.background = "var(--accent)"; btn.textContent = "✅ Placed!";
-                updateOrdersAndLogs();
-                setTimeout(() => { btn.textContent = "Place Buy Order"; btn.disabled = false; }, 2000);
-            } else {
-                const err = await res.json();
-                alert("Failed: " + err.detail); btn.disabled = false;
-            }
-        } catch(e) { alert("Error"); btn.disabled = false; }
-    }
-
-    async function cancelById(id) {
-        if(confirm("이 주문을 취소하시겠습니까?")) {
-            await fetch(`${API_URL}/cancel-order/${id}`, { method: 'POST' });
-            updateOrdersAndLogs();
-        }
-    }
-
-    async function batchCancelManual() {
-        if(confirm("모든 수동 주문을 일괄 취소하시겠습니까?")) {
-            await fetch(`${API_URL}/batch-cancel-manual`, { method: 'POST' });
-            updateOrdersAndLogs();
-        }
-    }
-
-    async function resetHalt() {
-        if(confirm("Resume system operations?")) {
-            await fetch(`${API_URL}/reset-bot`, {method: 'POST'});
-            updateStatus();
-        }
-    }
-    function clearLogs() { document.getElementById('logs').innerHTML = ""; }
-    function setSort(key) { sortKey = key; updateMarkets(); }
-
-    setInterval(updateStatus, 1000);
-    setInterval(updateMarkets, 2000);
-    setInterval(updateOrdersAndLogs, 1500);
-    setInterval(updateWallet, 10000);
-    updateStatus(); updateMarkets(); updateWallet(); updateOrdersAndLogs();
+    setInterval(updateStatus, 1500); 
+    setInterval(updateWallet, 3000); 
+    setInterval(updateMarkets, 5000);
+    setInterval(updateOrders, 2000); 
+    setInterval(updateLogs, 3000);
+    updateMarkets(); updateStatus(); updateWallet(); updateOrders(); updateLogs();
 </script>
 </body>
 </html>

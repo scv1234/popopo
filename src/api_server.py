@@ -69,19 +69,17 @@ def get_honey_pots():
 
 @app.get("/status")
 async def get_status():
-    """대시보드 실시간 모니터링을 위한 상태 정보를 반환합니다."""
-    # 실시간 호가 정보
-    yes_book = bot.orderbooks.get(bot.yes_token_id, {})
+    """봇의 작동 상태와 인벤토리 정보만 반환합니다."""
+    yes_token = getattr(bot, 'yes_token_id', None)
+    yes_book = bot.orderbooks.get(yes_token, {}) if yes_token else {}
     best_bid = float(yes_book.get("best_bid", 0))
     best_ask = float(yes_book.get("best_ask", 1))
     mid_price = bot.quote_engine.calculate_mid_price(best_bid, best_ask)
-    
-    # 리워드 세이프티 마진 계산
     current_spread = getattr(bot, 'spread_cents', 3)
 
     return {
         "is_halted": bot.risk_manager.is_halted,
-        "is_locked": bot.state_lock.locked(),  # 마켓 전환 중(Lock) 여부
+        "is_locked": bot.state_lock.locked(),
         "inventory": {
             "yes": bot.inventory_manager.inventory.yes_position,
             "no": bot.inventory_manager.inventory.no_position,
@@ -90,15 +88,30 @@ async def get_status():
         },
         "market": {
             "market_id": bot.current_market_id, 
-            "yes_token_id": bot.yes_token_id,
-            "no_token_id": bot.no_token_id,
             "mid_price": round(mid_price, 4),
-            "margin_usd": round(current_spread * 0.9 / 100.0, 4),
-            "best_bid": best_bid,
-            "best_ask": best_ask,
             "spread_cents": current_spread
         }
     }
+
+# 추가로 /wallet 엔드포인트에서도 매틱을 제거하여 깔끔하게 만듭니다.
+@app.get("/wallet")
+async def get_wallet():
+    """RPC를 통해 실제 지갑의 USDC 잔고를 조회합니다."""
+    try:
+        w3 = Web3(Web3.HTTPProvider(settings.rpc_url))
+        # 봇이 사용하는 공개 주소 또는 프록시 주소 설정
+        address = Web3.to_checksum_address(settings.public_address)
+        
+        usdc_contract = w3.eth.contract(address=Web3.to_checksum_address(USDC_ADDRESS), abi=ERC20_ABI)
+        raw_balance = usdc_contract.functions.balanceOf(address).call()
+        decimals = usdc_contract.functions.decimals().call()
+        usdc_balance = raw_balance / (10 ** decimals)
+
+        return {
+            "usdc_balance": float(usdc_balance)
+        }
+    except Exception as e:
+        return {"usdc_balance": 0.0, "error": str(e)}
 
 @app.post("/place-semi-auto-order")
 async def place_semi_auto_order(req: OrderRequest):
@@ -159,18 +172,26 @@ async def get_wallet():
 
 @app.get("/open-orders")
 async def get_open_orders():
-    """현재 거래소 활성 주문 리스트 (마켓 및 결과 정보 포함)"""
-    orders = []
+    """현재 거래소 활성 주문 리스트를 마켓별, 결과별(YES/NO)로 그룹화하여 반환"""
+    grouped = {}
+    
     for order_id, details in bot.open_orders.items():
-        orders.append({
+        market_id = details.get("market", "Unknown")
+        outcome = details.get("outcome", "YES") # 'YES' 또는 'NO'
+        
+        # 마켓별 초기화
+        if market_id not in grouped:
+            grouped[market_id] = {"YES": [], "NO": []}
+            
+        # 해당 마켓의 YES 또는 NO 리스트에 주문 추가
+        grouped[market_id][outcome].append({
             "order_id": order_id,
-            "market": details.get("market", "Unknown"), # 마켓 ID 추가
-            "outcome": details.get("outcome", "Unknown"), # YES/NO 추가
             "side": details.get("side"),
             "price": float(details.get("price")),
             "size": float(details.get("size"))
         })
-    return orders
+    
+    return grouped
 
 @app.post("/batch-cancel-manual")
 async def batch_cancel_manual():
@@ -184,6 +205,57 @@ async def cancel_order(order_id: str):
     if not success:
         raise HTTPException(status_code=404, detail="주문을 찾을 수 없거나 취소에 실패했습니다.")
     return {"status": "success"}
+
+@app.get("/recommend-allocation")
+async def recommend_allocation(total_budget: float = 1000.0):
+    # 1. 현재 꿀통 데이터 가져오기
+    pots = get_honey_pots() # DB에서 로드
+    if not pots: return {"error": "No market data available"}
+
+    # 2. 시뮬레이션 (Greedy 알고리즘)
+    # $1씩 가장 효율이 좋은 곳에 배분하는 방식
+    allocations = {p['market_id']: 0.0 for p in pots}
+    step = 5.0 # 5달러 단위로 배분 시뮬레이션
+    current_budget = total_budget
+
+    while current_budget >= step:
+        best_market = None
+        max_gain = -1
+        
+        for p in pots:
+            mid = p['market_id']
+            r = p['reward']
+            d = p['total_depth']
+            x = allocations[mid]
+            
+            # 현재 수익 vs 5달러 더 넣었을 때 수익 차이 계산
+            current_rev = r * (x / (d + x)) if (d + x) > 0 else 0
+            next_rev = r * ((x + step) / (d + x + step))
+            gain = next_rev - current_rev
+            
+            if gain > max_gain:
+                max_gain = gain
+                best_market = mid
+        
+        if best_market:
+            allocations[best_market] += step
+            current_budget -= step
+        else: break
+
+    # 3. 결과 정리 (수익 예상치 포함)
+    result = []
+    for p in pots:
+        amt = allocations[p['market_id']]
+        if amt > 0:
+            est_profit = p['reward'] * (amt / (p['total_depth'] + amt))
+            result.append({
+                "title": p['title'],
+                "recommend_usd": amt,
+                "est_daily_profit": round(est_profit, 2),
+                "roi_pct": round((est_profit / amt) * 100, 2)
+            })
+            
+    return sorted(result, key=lambda x: x['recommend_usd'], reverse=True)
 
 @app.get("/logs")
 async def get_logs():
