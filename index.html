@@ -128,8 +128,6 @@
         .row-selected { background-color: rgba(88, 166, 255, 0.1) !important; }
 
         .badge { padding: 4px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
-        .badge-green { background: rgba(35, 134, 54, 0.2); color: #7ee787; }
-        .badge-blue { background: rgba(56, 139, 253, 0.15); color: #58a6ff; }
         
         .profit-pos { color: #7ee787; font-weight: bold; }
         .profit-neu { color: var(--text-muted); }
@@ -200,12 +198,8 @@
             <button onclick="placeOrder()" id="btn-order">Place Buy Order</button>
 
             <div style="margin-top: 20px; border-top: 1px solid var(--border); padding-top: 10px;">
-                <label>Manual Order Cancellations</label>
-                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
-                    <button onclick="cancelOutcome('YES')" class="btn-red">Cancel YES</button>
-                    <button onclick="cancelOutcome('NO')" class="btn-red">Cancel NO</button>
-                </div>
-                <button onclick="batchCancelManual()" class="btn-gray">Batch Cancel Manual Orders</button>
+                <label>Emergency Controls</label>
+                <button onclick="batchCancelManual()" class="btn-gray">Batch Cancel All Manual Orders</button>
             </div>
         </div>
 
@@ -230,7 +224,9 @@
                     <thead>
                         <tr>
                             <th width="8%" onclick="setSort('score')">Score ▾</th>
-                            <th width="32%">Market Title</th> <th width="10%">Min Shares</th>   <th width="12%">Reward/Day</th>
+                            <th width="32%">Market Title</th> 
+                            <th width="10%">Min Shares</th>   
+                            <th width="12%">Reward/Day</th>
                             <th width="12%" onclick="setSort('profit')">Est. Profit ▾</th>
                             <th width="10%">Depth</th>
                             <th width="8%">Spread</th>
@@ -306,7 +302,7 @@
             });
             
             if (data.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; padding: 30px; color: var(--text-muted);">No opportunities found with current filters.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; padding: 30px; color: var(--text-muted);">No opportunities found.</td></tr>';
                 return;
             }
 
@@ -322,19 +318,16 @@
                 return b.score - a.score;
             });
 
-            const list = data; 
-
             let html = '';
-            list.forEach(m => {
+            data.forEach(m => {
                 const isSelected = (m.market_id === selectedId) ? 'row-selected' : '';
                 const profitClass = m.estProfit > 10 ? 'profit-pos' : 'profit-neu';
                 
                 html += `<tr onclick="selectMarket('${m.market_id}')" class="${isSelected}">
                     <td style="color:var(--gold); font-weight:bold;">${m.score.toFixed(1)}</td>
-                    <td>
-                        <div style="font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width: 320px;">${m.title}</div>
-                    </td>
-                    <td style="color:var(--blue); font-weight:500;">${m.min_size}</td> <td>$${m.reward.toLocaleString()}</td>
+                    <td><div style="font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width: 320px;">${m.title}</div></td>
+                    <td style="color:var(--blue); font-weight:500;">${m.min_size}</td> 
+                    <td>$${m.reward.toLocaleString()}</td>
                     <td class="${profitClass}">$${m.estProfit.toFixed(2)}</td>
                     <td style="color:var(--text-muted)">$${m.total_depth.toLocaleString()}</td>
                     <td><span class="badge badge-blue">${m.spread_cents}¢</span></td>
@@ -347,6 +340,7 @@
 
     async function updateOrdersAndLogs() {
         try {
+            // Update Active Orders
             const res = await fetch(`${API_URL}/open-orders`);
             const orders = await res.json();
             const div = document.getElementById('open-orders');
@@ -355,20 +349,26 @@
                 div.innerHTML = '<div style="text-align:center; padding:15px; color:var(--text-muted);">No active orders</div>';
             } else {
                 div.innerHTML = orders.map(o => `
-                    <div style="border-bottom:1px solid #30363d; padding:8px 0; display:flex; justify-content:space-between; align-items:center;">
-                        <div>
-                            <span class="badge" style="background:${o.side==='BUY'?'rgba(35,134,54,0.2)':'rgba(218,54,51,0.2)'}; color:${o.side==='BUY'?'#7ee787':'#f85149'}">${o.side}</span>
-                            <span style="margin-left:5px; font-weight:bold;">${parseFloat(o.size).toFixed(0)}</span>
+                    <div style="border-bottom:1px solid #30363d; padding:12px 0; display:flex; flex-direction:column; gap:5px;">
+                        <div style="display:flex; justify-content:space-between; align-items:center;">
+                            <div>
+                                <span class="badge" style="background:${o.side==='BUY'?'rgba(35,134,54,0.2)':'rgba(218,54,51,0.2)'}; color:${o.side==='BUY'?'#7ee787':'#f85149'}">${o.side}</span>
+                                <b style="color:var(--gold); margin-left:5px;">${o.outcome}</b>
+                                <span style="font-weight:bold; margin-left:5px;">${parseFloat(o.size).toFixed(0)} shares</span>
+                            </div>
+                            <button onclick="cancelById('${o.order_id}')" style="width:auto; margin:0; padding:4px 8px; font-size:11px; background:var(--red); height:24px;">Cancel</button>
                         </div>
-                        <span style="font-family:Consolas; color:var(--text-muted);">@ ${o.price}</span>
+                        <div style="font-size:11px; color:var(--text-muted); display:flex; justify-content:space-between;">
+                            <span>MKT: ${o.market.substring(0,12)}...</span>
+                            <span>Price: ${o.price}</span>
+                        </div>
                     </div>
                 `).join('');
             }
-        } catch (e) {}
 
-        try {
-            const res = await fetch(`${API_URL}/logs`);
-            const logs = await res.json();
+            // Update Logs
+            const logRes = await fetch(`${API_URL}/logs`);
+            const logs = await logRes.json();
             const logDiv = document.getElementById('logs');
             const recentLogs = logs.slice(-50);
             
@@ -395,16 +395,12 @@
     async function placeOrder() {
         const id = document.getElementById('order-market-id').value;
         const amt = parseFloat(document.getElementById('order-amount').value);
-        
-        if(!id) return alert("Please select a market from the list first.");
+        if(!id) return alert("Please select a market.");
 
         const marketInfo = marketDataMap[id];
-        if (!marketInfo) return alert("Market info not found!");
-        
-        if(!confirm(`Confirm Buy Order?\n\nMarket: ${id}\nAmount: $${amt}`)) return;
+        if(!confirm(`Confirm Order?\nMarket: ${id}\nAmount: $${amt}`)) return;
 
         const btn = document.getElementById('btn-order');
-        const originalText = btn.textContent;
         btn.textContent = "Processing...";
         btn.disabled = true;
 
@@ -413,84 +409,46 @@
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({ 
-                    market_id: id, 
-                    amount: amt,
+                    market_id: id, amount: amt,
                     yes_token_id: marketInfo.yes_token_id,
                     no_token_id: marketInfo.no_token_id
                 })
             });
-            
             if(res.ok) {
                 btn.style.background = "var(--accent)";
-                btn.textContent = "✅ Order Placed!";
+                btn.textContent = "✅ Placed!";
                 updateOrdersAndLogs();
-                setTimeout(() => {
-                    btn.textContent = originalText;
-                    btn.disabled = false;
-                }, 2000);
+                setTimeout(() => { btn.textContent = "Place Buy Order"; btn.disabled = false; }, 2000);
             } else {
-                const err = await res.json();
-                alert("Order Failed: " + err.detail);
-                btn.textContent = originalText;
+                alert("Failed: " + (await res.json()).detail);
                 btn.disabled = false;
             }
-        } catch(e) {
-            alert("Network Error");
-            btn.textContent = originalText;
-            btn.disabled = false;
+        } catch(e) { alert("Error"); btn.disabled = false; }
+    }
+
+    async function cancelById(id) {
+        if(confirm("이 주문을 취소하시겠습니까?")) {
+            await fetch(`${API_URL}/cancel-order/${id}`, { method: 'POST' });
+            updateOrdersAndLogs();
         }
     }
 
-    // [추가] 개별 취소 요청 함수
-    async function cancelOutcome(outcome) {
-        if(!confirm(`Cancel manual ${outcome} order?`)) return;
-        try {
-            const res = await fetch(`${API_URL}/cancel-manual-outcome`, {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ outcome })
-            });
-            if(res.ok) {
-                updateOrdersAndLogs();
-            } else {
-                const err = await res.json();
-                alert("Cancel failed: " + err.detail);
-            }
-        } catch(e) {
-            alert("Network error occurred during cancellation.");
-        }
-    }
-
-    // [추가] 일괄 취소 요청 함수
     async function batchCancelManual() {
-        if(!confirm("Cancel ALL manual orders?")) return;
-        try {
-            const res = await fetch(`${API_URL}/batch-cancel-manual`, { method: 'POST' });
-            if(res.ok) {
-                updateOrdersAndLogs();
-            } else {
-                alert("Batch cancellation failed.");
-            }
-        } catch(e) {
-            alert("Network error occurred during batch cancellation.");
+        if(confirm("모든 수동 주문을 일괄 취소하시겠습니까?")) {
+            await fetch(`${API_URL}/batch-cancel-manual`, { method: 'POST' });
+            updateOrdersAndLogs();
         }
     }
 
     async function resetHalt() {
         if(confirm("Resume system operations?")) {
-            await fetch(`${API_URL}/reset-halt`, {method: 'POST'});
+            await fetch(`${API_URL}/reset-bot`, {method: 'POST'});
             updateStatus();
         }
     }
     
-    function clearLogs() {
-        document.getElementById('logs').innerHTML = "";
-    }
-
-    function setSort(key) {
-        sortKey = key;
-        updateMarkets();
-    }
+    function clearLogs() { document.getElementById('logs').innerHTML = ""; }
+    function setSort(key) { sortKey = key; updateMarkets(); }
 
     // --- Init ---
     setInterval(updateStatus, 1000);

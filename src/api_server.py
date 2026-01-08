@@ -155,31 +155,31 @@ async def get_wallet():
 
 @app.get("/open-orders")
 async def get_open_orders():
-    """현재 거래소 활성 주문 리스트"""
+    """현재 거래소 활성 주문 리스트 (마켓 및 결과 정보 포함)"""
     orders = []
-    # 봇의 메모리에 있는 주문 목록 반환
     for order_id, details in bot.open_orders.items():
         orders.append({
             "order_id": order_id,
+            "market": details.get("market", "Unknown"), # 마켓 ID 추가
+            "outcome": details.get("outcome", "Unknown"), # YES/NO 추가
             "side": details.get("side"),
             "price": float(details.get("price")),
-            "size": float(details.get("size")),
-            "token_id": details.get("token_id")
+            "size": float(details.get("size"))
         })
     return orders
-
-@app.post("/cancel-manual-outcome")
-async def cancel_outcome(payload: dict):
-    outcome = payload.get("outcome") # "YES" 또는 "NO"
-    success = await bot.cancel_manual_order_by_outcome(outcome)
-    if not success:
-        raise HTTPException(status_code=404, detail=f"No active manual {outcome} order found")
-    return {"status": "success"}
 
 @app.post("/batch-cancel-manual")
 async def batch_cancel_manual():
     success = await bot.batch_cancel_manual_orders()
     return {"status": "success" if success else "failed"}    
+
+@app.post("/cancel-order/{order_id}")
+async def cancel_order(order_id: str):
+    """특정 주문 ID를 사용하여 개별 취소"""
+    success = await bot.cancel_single_order(order_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="주문을 찾을 수 없거나 취소에 실패했습니다.")
+    return {"status": "success"}
 
 @app.get("/logs")
 async def get_logs():

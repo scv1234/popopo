@@ -451,6 +451,11 @@ class MarketMakerBot:
         # 3. [핵심] 변동성 데이터 추출 및 쿼트 계산
         # 오더북에서 1시간 변동성 데이터를 가져오며, 없을 경우 기본값 0.005(0.5%)를 사용합니다.
         vol_1h = float(self.current_orderbook.get("volatility_1h", 0.005))
+        if vol_1h >= 0.045:
+            logger.warning("🚨 UNSTABLE_MARKET_DETECTED", vol_1h=vol_1h, threshold=0.045)
+            # 모든 수동 주문을 즉시 취소하고 상태를 초기화 (도망가기)
+            await self._reset_local_market_state()
+            return
         
         # QuoteEngine은 이 vol_1h를 바탕으로 dynamic_spread를 계산합니다.
         # 비록 자동 주문을 내지 않더라도, 현재 시장의 '적정 호가'를 계산하여 로그로 남기거나 
@@ -476,10 +481,12 @@ class MarketMakerBot:
         # if yes_q: await self._place_quote(yes_q, "YES")
         # if no_q: await self._place_quote(no_q, "NO")
         
-        logger.debug("quoting_cycle_monitored", vol_1h=vol_1h, market=self.current_market_id)
 
     async def _place_quote(self, quote: Any, outcome: str, is_manual: bool = False):
-        # Risk Manager 검증 (수정된 인자 반영)
+        """
+        [수정] 인자에 is_manual을 추가하고, order_id 정의 후 사용하도록 변경
+        """
+        # Risk Manager 검증
         valid, reason = self.risk_manager.validate_order(
             quote.side, quote.size, self.current_orderbook
         )
@@ -490,19 +497,33 @@ class MarketMakerBot:
 
         try:
             order_data = {
-                "market": quote.market, "side": quote.side, "size": str(quote.size),
-                "price": str(quote.price), "token_id": quote.token_id,
-                "outcome": outcome
+                "market": quote.market, 
+                "side": quote.side, 
+                "size": str(quote.size),
+                "price": str(quote.price), 
+                "token_id": quote.token_id,
+                "outcome": outcome  # 취소 기능을 위해 추가
             }
+            
+            # 주문 전송
             result = await self.order_executor.place_order(order_data)
+            
             if result and "id" in result: 
-                self.open_orders[result["id"]] = order_data
+                # [핵심] order_id 변수를 먼저 할당해야 합니다.
+                order_id = result["id"]
+                
+                self.open_orders[order_id] = order_data
 
+                # 수동 주문인 경우 추적 목록에 추가
                 if is_manual:
                     self.manual_order_ids.add(order_id)
+                
                 return True
+                
         except Exception as e:
+            # 여기서 "name 'order_id' is not defined" 에러가 잡혔던 것입니다.
             logger.error("place_quote_failed", error=str(e))
+            
         return False
 
     async def _cancel_stale_orders(self):
@@ -576,6 +597,11 @@ class MarketMakerBot:
             reward_json = responses[0]
             orderbook = responses[1]
 
+            vol_1h = float(orderbook.get("volatility_1h", 0.005))
+            if vol_1h >= 0.045:
+                logger.error("manual_order_blocked_unstable_market", vol_1h=vol_1h)
+                return False
+
             # [핵심 수정] 리스트에서 직접 Best Bid/Ask 추출
             # CLOB API 결과는 {"bids": [{"price": "0.5", "size": "100"}, ...], "asks": [...]} 형태임
             bids = orderbook.get("bids", [])
@@ -640,24 +666,18 @@ class MarketMakerBot:
             logger.error("manual_order_exception", error=str(e))
             return False
 
-    async def cancel_manual_order_by_outcome(self, outcome: str) -> bool:
-        """YES 또는 NO 주문을 찾아 개별 취소합니다."""
-        target_id = None
-        # 현재 열린 수동 주문 중 해당 outcome(YES/NO)을 찾습니다.
-        for oid in list(self.manual_order_ids):
-            order_info = self.open_orders.get(oid)
-            if order_info and order_info.get("outcome") == outcome:
-                target_id = oid
-                break
+    async def cancel_single_order(self, order_id: str) -> bool:
+        """특정 ID의 주문을 취소하고 관리 목록에서 제거합니다."""
+        logger.info("request_cancel_single_order", id=order_id)
         
-        if target_id:
-            logger.info(f"cancelling_specific_manual_order", outcome=outcome, id=target_id)
-            # OrderExecutor의 cancel_order(개별 취소) 사용
-            success = await self.order_executor.cancel_order(target_id)
-            if success:
-                self.manual_order_ids.discard(target_id)
-                self.open_orders.pop(target_id, None)
-                return True
+        # OrderExecutor를 통해 거래소에 취소 요청
+        success = await self.order_executor.cancel_order(order_id)
+        
+        if success:
+            # 관리 목록에서 해당 ID 제거
+            self.manual_order_ids.discard(order_id)
+            self.open_orders.pop(order_id, None)
+            return True
         return False
 
     async def batch_cancel_manual_orders(self) -> bool:

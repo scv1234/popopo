@@ -56,22 +56,29 @@ class QuoteEngine:
         2. 인벤토리 불균형에 따른 가격 스큐(Skewing) 적용
         3. 보상 범위(90% 지점) 최적화 유지
         """
+
+        # 0. 변동성 임계치 체크 (가장 먼저 실행)
+        # 1시간 변동성이 4.5%를 넘으면 시장이 매우 불안정한 것으로 간주하고 도망갑니다.
+        if volatility_1h >= 0.045:
+            logger.warning("unstable_market_detected_skipping_quotes", 
+                           vol=round(volatility_1h, 4), threshold=0.045)
+            return (None, None)
         
-        # 0. 기본 주문 수량 결정
+        # 1. 기본 주문 수량 결정
         size = user_input_shares if user_input_shares is not None else self.settings.default_size
         final_shares = max(size, min_size_shares)
 
-        # 1. 중간가(Mid-price) 계산
+        # 2. 중간가(Mid-price) 계산
         mid_price = self.calculate_mid_price(best_bid, best_ask)
         if mid_price == 0:
             return (None, None)
 
-        # 2. [고도화] 동적 스프레드 (Dynamic Spread)
-        # 변동성이 높을수록 안전 마진을 위해 스프레드를 확대합니다. (1.0x ~ 2.5x)
+        # 3. [고도화] 동적 스프레드 (Dynamic Spread)
+        # 변동성이 높을수록 안전 마진을 위해 스프레드를 확대합니다. (3)
         volatility_multiplier = max(1.0, min(3.0, 1 + (volatility_1h * 100))) 
         dynamic_spread_usd = (spread_cents * volatility_multiplier) / 100.0
 
-        # 3. [고도화] 가격 스큐 (Price Skewing)
+        # 4. [고도화] 가격 스큐 (Price Skewing)
         # 내 지갑의 YES/NO 수량 차이를 확인하여 가격을 비틉니다.
         # net_exposure_shares가 양수(+)면 YES가 많음 -> 주문 가격을 낮춤 (SELL 유도)
         inventory_diff = self.inventory_manager.inventory.net_exposure_shares
