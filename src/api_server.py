@@ -71,8 +71,9 @@ def get_honey_pots():
 async def get_status():
     """대시보드 실시간 모니터링을 위한 상태 정보를 반환합니다."""
     # 실시간 호가 정보
-    best_bid = float(bot.current_orderbook.get("best_bid", 0))
-    best_ask = float(bot.current_orderbook.get("best_ask", 1))
+    yes_book = bot.orderbooks.get(bot.yes_token_id, {})
+    best_bid = float(yes_book.get("best_bid", 0))
+    best_ask = float(yes_book.get("best_ask", 1))
     mid_price = bot.quote_engine.calculate_mid_price(best_bid, best_ask)
     
     # 리워드 세이프티 마진 계산
@@ -80,7 +81,7 @@ async def get_status():
 
     return {
         "is_halted": bot.risk_manager.is_halted,
-        "is_locked": bot.state_lock.locked(), # [추가] 마켓 전환 중(Lock) 여부
+        "is_locked": bot.state_lock.locked(),  # 마켓 전환 중(Lock) 여부
         "inventory": {
             "yes": bot.inventory_manager.inventory.yes_position,
             "no": bot.inventory_manager.inventory.no_position,
@@ -88,8 +89,9 @@ async def get_status():
             "skew": bot.inventory_manager.inventory.get_skew()
         },
         "market": {
-            # [수정] settings.market_id 대신 현재 활성 마켓 ID 사용
             "market_id": bot.current_market_id, 
+            "yes_token_id": bot.yes_token_id,
+            "no_token_id": bot.no_token_id,
             "mid_price": round(mid_price, 4),
             "margin_usd": round(current_spread * 0.9 / 100.0, 4),
             "best_bid": best_bid,

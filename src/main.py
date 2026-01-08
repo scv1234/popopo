@@ -207,15 +207,10 @@ class MarketMakerBot:
     # =========================================================================
 
     def _handle_orderbook_update(self, data: dict[str, Any]):
-        """실시간 오더북 업데이트 수신"""
-        # 현재 마켓 데이터가 아니면 무시 (Race Condition 방지)
-        if data.get("market") != self.current_market_id:
-            return
-
-        self.current_orderbook = data.get("book", self.current_orderbook)
-        
-        # 방어 로직은 메인 루프를 막지 않기 위해 비동기 Task로 실행
-        asyncio.create_task(self.check_and_defend_orders())
+        asset_id = data.get("asset_id") or data.get("token_id")
+        if asset_id in [self.yes_token_id, self.no_token_id]:
+            self.orderbooks[asset_id] = data.get("book", self.orderbooks.get(asset_id, {}))
+            asyncio.create_task(self.check_and_defend_orders())
 
     def _handle_trade_update(self, data: dict[str, Any]):
         """내 주문 체결 정보 수신"""
@@ -446,12 +441,15 @@ class MarketMakerBot:
         self.last_quote_time = now_ms
 
         # 2. 데이터 최신화 확인
-        if not self.current_orderbook:
+        if not self.orderbooks.get(self.yes_token_id) or not self.orderbooks.get(self.no_token_id):
             await self.update_orderbook()
+
+        yes_book = self.orderbooks.get(self.yes_token_id, {})
+        no_book = self.orderbooks.get(self.no_token_id, {})
 
         # 3. [독성 흐름 방어] OBI(호가 불균형) 체크
         # 변동성이 낮더라도 호가창의 물량이 한쪽으로 쏠리면 급변동의 전조(독성 흐름)입니다.
-        risk_valid, reason = self.risk_manager.validate_obi(self.current_orderbook)
+        risk_valid, reason = self.risk_manager.validate_obi(yes_book)
         if not risk_valid:
             logger.warning("🚨 TOXIC_FLOW_PRECURSOR_DETECTED", reason=reason)
             # 위험 상황이므로 기존 주문을 모두 거두어들이고 대기합니다.
@@ -465,10 +463,23 @@ class MarketMakerBot:
         # 이제 QuoteEngine 내부 로직에 의해 0.045 이상이면 자동으로 동적 스프레드가 계산됩니다.
 
         # 5. 쿼트 계산 (동적 스프레드 및 스큐 적용)
+        def get_best(book):
+            bids = book.get("bids", [])
+            asks = book.get("asks", [])
+            bb = float(bids[0]['price']) if bids else 0.0
+            ba = float(asks[0]['price']) if asks else 1.0
+            return bb, ba
+
+        y_bb, y_ba = get_best(yes_book)
+        n_bb, n_ba = get_best(no_book)
+
+        # 6. QuoteEngine을 통한 독립적 호가 생성
         yes_q, no_q = self.quote_engine.generate_quotes(
             market_id=self.current_market_id, 
-            best_bid=float(self.current_orderbook.get("best_bid", 0)),
-            best_ask=float(self.current_orderbook.get("best_ask", 1)),
+            yes_best_bid=y_bb,
+            yes_best_ask=y_ba,
+            no_best_bid=n_bb,
+            no_best_ask=n_ba,
             yes_token_id=self.yes_token_id, 
             no_token_id=self.no_token_id,
             spread_cents=self.spread_cents,
@@ -476,6 +487,16 @@ class MarketMakerBot:
             tick_size=self.current_tick_size,
             volatility_1h=vol_1h 
         )
+
+        # [로그 추가] 자동 주문 실행 시 로그 출력
+        if yes_q or no_q:
+            y_mid = (y_bb + y_ba) / 2
+            n_mid = (n_bb + n_ba) / 2
+            y_p = yes_q.price if yes_q else "N/A"
+            n_p = no_q.price if no_q else "N/A"
+            size = yes_q.size if yes_q else (no_q.size if no_q else 0)
+            
+            logger.info(f"[EXECUTED] Auto | Y_Mid: {y_mid:.3f}, N_Mid: {n_mid:.3f} | YES: {y_p} | NO: {n_p} | Shares: {size}")
 
         # 6. 기존 주문 정리 (Selective Cancel)
         # 계산된 쿼트 범위를 벗어난 주문이나 오래된 주문을 정리합니다.

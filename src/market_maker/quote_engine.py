@@ -40,8 +40,10 @@ class QuoteEngine:
     def generate_quotes(
         self, 
         market_id: str, 
-        best_bid: float, 
-        best_ask: float, 
+        yes_best_bid: float, 
+        yes_best_ask: float,
+        no_best_bid: float,
+        no_best_ask: float,
         yes_token_id: str, 
         no_token_id: str, 
         spread_cents: float,
@@ -62,23 +64,27 @@ class QuoteEngine:
         final_shares = max(size, min_size_shares)
 
         # 2. 중간가(Mid-price) 계산
-        mid_price = self.calculate_mid_price(best_bid, best_ask)
-        if mid_price == 0:
+        yes_mid = self.calculate_mid_price(yes_best_bid, yes_best_ask)
+        no_mid = self.calculate_mid_price(no_best_bid, no_best_ask)
+    
+        # 두 토큰 모두 유효한 호가가 없으면 주문을 생성하지 않음
+        if yes_mid == 0 and no_mid == 0:
             return (None, None)
 
-        # 3. [핵심 로직] 변동성에 따른 배율 결정
+        # 3. 변동성에 따른 스프레드 배율 결정
         if volatility_1h < 0.045:
-            # 안정적일 때는 1.0배 고정하여 보상 획득에 집중
+            # 안정적인 시장에서는 기본 스프레드(1.0배) 유지
             volatility_multiplier = 1.0
         else:
-            # 0.045 이상일 때는 동적 스프레드를 활성화하여 위험 회피 (최대 3.0배)
+            # 고변동성 시장에서는 위험 회피를 위해 스프레드를 동적으로 확대 (최대 3.0배)
             volatility_multiplier = max(1.0, min(3.0, 1 + (volatility_1h * 100)))
             logger.warning("🚨 HIGH_VOLATILITY_DYNAMIC_DEFENSE", 
                            vol=round(volatility_1h, 4), 
                            multiplier=volatility_multiplier)
 
-        # 최종 스프레드 계산
+        # 최종 스프레드 및 리워드 획득을 위한 90% 마진 계산
         dynamic_spread_usd = (spread_cents * volatility_multiplier) / 100.0
+        margin_usd = dynamic_spread_usd * 0.9
 
         # 4. 가격 스큐 (Price Skewing) 유지
         inventory_diff = self.inventory_manager.inventory.net_exposure_shares
@@ -88,26 +94,28 @@ class QuoteEngine:
         margin_usd = dynamic_spread_usd * 0.9
         
         # 스큐 적용 중간가 산출
-        skewed_mid = mid_price - skew_adjustment
+        yes_skewed_mid = yes_mid - skew_adjustment
+        no_skewed_mid = no_mid + skew_adjustment
         
         # YES/NO 주문 가격 산출
-        bid_price = self.round_to_tick(skewed_mid - margin_usd, tick_size)
-        ask_price = self.round_to_tick(skewed_mid + margin_usd, tick_size)
-        no_bid_price = self.round_to_tick(1.0 - ask_price, tick_size)
+        yes_bid_price = self.round_to_tick(yes_skewed_mid - margin_usd, tick_size)
+        no_bid_price = self.round_to_tick(no_skewed_mid - margin_usd, tick_size)
 
         # 5. 최종 Quote 생성
         yes_shares = self.inventory_manager.get_quote_size_yes(final_shares)
         no_shares = self.inventory_manager.get_quote_size_no(final_shares)
 
+        # YES 주문 객체 생성 (인벤토리 한도 및 가격 범위 검증)
         yes_quote = None
-        if self.inventory_manager.can_quote_yes(yes_shares) and 0.01 < bid_price < 0.99:
+        if yes_mid > 0 and self.inventory_manager.can_quote_yes(yes_shares) and 0.01 < yes_bid_price < 0.99:
             yes_quote = Quote(
-                side="BUY", price=bid_price, size=yes_shares,
+                side="BUY", price=yes_bid_price, size=yes_shares,
                 market=market_id, token_id=yes_token_id
             )
 
+        # NO 주문 객체 생성 (독립적으로 검증 및 생성)
         no_quote = None
-        if self.inventory_manager.can_quote_no(no_shares) and 0.01 < no_bid_price < 0.99:
+        if no_mid > 0 and self.inventory_manager.can_quote_no(no_shares) and 0.01 < no_bid_price < 0.99:
             no_quote = Quote(
                 side="BUY", price=no_bid_price, size=no_shares,
                 market=market_id, token_id=no_token_id
