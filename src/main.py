@@ -52,12 +52,11 @@ class MarketMakerBot:
         self.auto_redeem = AutoRedeem(settings)
         
         # 로컬 상태 변수
-        self.current_orderbook: dict[str, Any] = {}
+        self.orderbooks: dict[str, dict[str, Any]] = {}
         self.open_orders: dict[str, dict[str, Any]] = {}
         self.last_quote_time = 0.0
         self.trade_timestamps = []
         self.manual_order_ids: set[str] = set()
-
         # 마켓 정보
         self.current_market_id = settings.market_id
         self.yes_token_id = ""
@@ -96,8 +95,9 @@ class MarketMakerBot:
         
         # 마켓이 설정되었다면 오더북 구독
         if self.current_market_id:
-            await self.ws_client.subscribe_orderbook(self.current_market_id)
-            await self.update_orderbook() # 초기 데이터 로드
+            if self.yes_token_id: await self.ws_client.subscribe_orderbook(self.yes_token_id)
+            if self.no_token_id: await self.ws_client.subscribe_orderbook(self.no_token_id)
+            await self.update_orderbook()
 
         # 4. 병렬 루프 실행 (핵심 태스크 분리)
         tasks = [
@@ -171,7 +171,8 @@ class MarketMakerBot:
 
             # 3. 새로운 마켓 구독 및 데이터 동기화
             if self.ws_client.running:
-                await self.ws_client.subscribe_orderbook(self.current_market_id)
+                if self.yes_token_id: await self.ws_client.subscribe_orderbook(self.yes_token_id)
+                if self.no_token_id: await self.ws_client.subscribe_orderbook(self.no_token_id)
                 await self.update_orderbook()
 
             # [핵심] 해당 마켓의 틱 사이즈 정보를 동적으로 가져옴
@@ -192,13 +193,18 @@ class MarketMakerBot:
             await _critical_section()
 
     async def update_orderbook(self):
-        """REST API를 통해 오더북 스냅샷을 가져옵니다 (초기화/리프레시용)"""
-        target_token = self.yes_token_id or self.current_market_id
-        if not target_token: return
+        """REST API를 통해 YES/NO 오더북 스냅샷을 병렬로 가져옵니다"""
+        session = await self.honeypot_service.get_session()
+        tasks = []
+        if self.yes_token_id: tasks.append(self.honeypot_service.get_orderbook(session, self.yes_token_id))
+        if self.no_token_id: tasks.append(self.honeypot_service.get_orderbook(session, self.no_token_id))
+            
+        if not tasks: return
         
         try:
-            session = await self.honeypot_service.get_session()
-            self.current_orderbook = await self.honeypot_service.get_orderbook(session, target_token)
+            results = await asyncio.gather(*tasks)
+            if self.yes_token_id: self.orderbooks[self.yes_token_id] = results[0]
+            if self.no_token_id and len(results) > 1: self.orderbooks[self.no_token_id] = results[1]
         except Exception as e:
             logger.error("update_orderbook_failed", error=str(e))
 
@@ -256,40 +262,40 @@ class MarketMakerBot:
         Lock을 사용하지 않고 빠르게 판단하되, 조치(Action)가 필요할 때만 개입합니다.
         """
         if self.risk_manager.is_halted: return
-        if not self.current_orderbook: return
 
-        # 1. 마켓 스프레드 계산
-        bids = self.current_orderbook.get("bids", [])
-        asks = self.current_orderbook.get("asks", [])
-        
-        if not bids or not asks: return
+        # 두 토큰 각각에 대해 방어 로직 수행
+        for token_id in [self.yes_token_id, self.no_token_id]:
+            book = self.orderbooks.get(token_id)
+            if not book: continue
 
-        best_bid = float(bids[0]['price'])
-        best_ask = float(asks[0]['price'])
-        market_spread = best_ask - best_bid
-        mid_price = (best_bid + best_ask) / 2.0
-        
-        spread_usd = self.spread_cents / 100.0
-        limit_spread = spread_usd * 2.5 # 허용 한계
+            bids = book.get("bids", [])
+            asks = book.get("asks", [])
+            if not bids or not asks: continue
 
-        # 2. 시장 스프레드 과다 이격 방어
-        if market_spread > limit_spread:
-            logger.warning("market_spread_too_wide", current=market_spread, limit=limit_spread)
-            await self._reset_local_market_state()
-            return
-
-        # 3. 개별 주문 위치 방어
-        for order_id, order in list(self.open_orders.items()):
-            price_diff = abs(mid_price - float(order.get("price", 0)))
+            best_bid = float(bids[0]['price'])
+            best_ask = float(asks[0]['price'])
+            market_spread = best_ask - best_bid
+            mid_price = (best_bid + best_ask) / 2.0
             
-            # 위험 구간: 스프레드 내 10% 안쪽으로 들어왔거나, 아예 밖으로 밀려난 경우
-            is_risky = price_diff < (spread_usd * 0.1)
-            is_invalid = price_diff > spread_usd
-            
-            if is_risky or is_invalid:
-                logger.info("defensive_action", reason="RISKY" if is_risky else "INVALID")
+            spread_usd = self.spread_cents / 100.0
+            limit_spread = spread_usd * 2.5
+
+            if market_spread > limit_spread:
+                logger.warning(f"market_spread_too_wide for {token_id}", current=market_spread)
                 await self._reset_local_market_state()
-                break
+                return
+
+            for order_id, order in list(self.open_orders.items()):
+                if order.get("token_id") != token_id: continue
+                
+                price_diff = abs(mid_price - float(order.get("price", 0)))
+                is_risky = price_diff < (spread_usd * 0.1)
+                is_invalid = price_diff > spread_usd
+                
+                if is_risky or is_invalid:
+                    logger.info("defensive_action", token=token_id, reason="RISKY" if is_risky else "INVALID")
+                    await self._reset_local_market_state()
+                    return
 
     async def _defend_after_trade(self, actual_price: float, order_id: str | None = None):
         """체결 직후 리스크 점검 (Circuit Breaker, Hedging)"""
@@ -400,11 +406,10 @@ class MarketMakerBot:
                 book = await self.honeypot_service.get_orderbook(session, target_token)
                 target_price = float(book.get("best_ask", 0.99))
 
-            hedge_order = {
+            await self.order_executor.place_order({
                 "market": self.current_market_id, "side": "BUY", "size": str(abs(amount)),
                 "price": str(target_price), "token_id": target_token
-            }
-            await self.order_executor.place_order(hedge_order)
+            })
         except Exception as e:
             logger.error("hedge_failed", error=str(e))
 
@@ -464,42 +469,23 @@ class MarketMakerBot:
 
         # 5. 쿼트 계산 (동적 스프레드 및 스큐 적용)
         def get_best(book):
-            bids = book.get("bids", [])
-            asks = book.get("asks", [])
-            bb = float(bids[0]['price']) if bids else 0.0
-            ba = float(asks[0]['price']) if asks else 1.0
-            return bb, ba
+            bids = book.get("bids", []); asks = book.get("asks", [])
+            return (float(bids[0]['price']) if bids else 0.0), (float(asks[0]['price']) if asks else 1.0)
 
         y_bb, y_ba = get_best(yes_book)
         n_bb, n_ba = get_best(no_book)
 
-        # 6. QuoteEngine을 통한 독립적 호가 생성
         yes_q, no_q = self.quote_engine.generate_quotes(
             market_id=self.current_market_id, 
-            yes_best_bid=y_bb,
-            yes_best_ask=y_ba,
-            no_best_bid=n_bb,
-            no_best_ask=n_ba,
-            yes_token_id=self.yes_token_id, 
-            no_token_id=self.no_token_id,
+            yes_best_bid=y_bb, yes_best_ask=y_ba,
+            no_best_bid=n_bb, no_best_ask=n_ba,
+            yes_token_id=self.yes_token_id, no_token_id=self.no_token_id,
             spread_cents=self.spread_cents,
             min_size_shares=self.min_size,
             tick_size=self.current_tick_size,
             volatility_1h=vol_1h 
         )
 
-        # [로그 추가] 자동 주문 실행 시 로그 출력
-        if yes_q or no_q:
-            y_mid = (y_bb + y_ba) / 2
-            n_mid = (n_bb + n_ba) / 2
-            y_p = yes_q.price if yes_q else "N/A"
-            n_p = no_q.price if no_q else "N/A"
-            size = yes_q.size if yes_q else (no_q.size if no_q else 0)
-            
-            logger.info(f"[EXECUTED] Auto | Y_Mid: {y_mid:.3f}, N_Mid: {n_mid:.3f} | YES: {y_p} | NO: {n_p} | Shares: {size}")
-
-        # 6. 기존 주문 정리 (Selective Cancel)
-        # 계산된 쿼트 범위를 벗어난 주문이나 오래된 주문을 정리합니다.
         await self._cancel_stale_orders()
 
         # 7. 신규 주문 제출 (수동 모드이므로 주석 유지)
@@ -511,9 +497,9 @@ class MarketMakerBot:
         [수정] 인자에 is_manual을 추가하고, order_id 정의 후 사용하도록 변경
         """
         # Risk Manager 검증
-        valid, reason = self.risk_manager.validate_order(
-            quote.side, quote.size, self.current_orderbook
-        )
+        # [수정] 해당 토큰의 오더북을 참조하여 검증
+        token_book = self.orderbooks.get(quote.token_id, {})
+        valid, reason = self.risk_manager.validate_order(quote.side, quote.size, token_book)
         
         if not valid:
             logger.debug("quote_skipped", reason=reason, outcome=outcome)
@@ -521,33 +507,17 @@ class MarketMakerBot:
 
         try:
             order_data = {
-                "market": quote.market, 
-                "side": quote.side, 
-                "size": str(quote.size),
-                "price": str(quote.price), 
-                "token_id": quote.token_id,
-                "outcome": outcome  # 취소 기능을 위해 추가
+                "market": quote.market, "side": quote.side, "size": str(quote.size),
+                "price": str(quote.price), "token_id": quote.token_id, "outcome": outcome
             }
-            
-            # 주문 전송
             result = await self.order_executor.place_order(order_data)
-            
             if result and "id" in result: 
-                # [핵심] order_id 변수를 먼저 할당해야 합니다.
                 order_id = result["id"]
-                
                 self.open_orders[order_id] = order_data
-
-                # 수동 주문인 경우 추적 목록에 추가
-                if is_manual:
-                    self.manual_order_ids.add(order_id)
-                
+                if is_manual: self.manual_order_ids.add(order_id)
                 return True
-                
         except Exception as e:
-            # 여기서 "name 'order_id' is not defined" 에러가 잡혔던 것입니다.
             logger.error("place_quote_failed", error=str(e))
-            
         return False
 
     async def _cancel_stale_orders(self):
@@ -577,7 +547,8 @@ class MarketMakerBot:
 
     async def execute_manual_safety_order(self, market_id: str, amount_usd: float, yes_id: str = None, no_id: str = None) -> bool:
         """
-        [수정됨] session.get을 올바르게 처리하여 리워드 정보와 호가창을 가져옵니다.
+        대시보드에서 '유동성 공급' 버튼 클릭 시 실행되는 수동 주문 로직.
+        YES와 NO 오더북을 각각 조회하여 독립적으로 가격을 산출하고 실행 정보를 로그로 남깁니다.
         """
         try:
             session = await self.honeypot_service.get_session()
@@ -593,13 +564,14 @@ class MarketMakerBot:
                     data = await res.json()
                     tokens = data.get("tokens", [])
                     if len(tokens) >= 2:
+                        # 'Yes', 'No' outcome에 맞춰 정확한 ID 추출
                         yes_id = next((t['token_id'] for t in tokens if t.get('outcome') == 'Yes'), tokens[0]['token_id'])
                         no_id = next((t['token_id'] for t in tokens if t.get('outcome') == 'No'), tokens[1]['token_id'])
                     else:
                         logger.error("tokens_empty")
                         return False
 
-            # [핵심 수정] session.get을 안전하게 수행하는 내부 헬퍼 함수 정의
+            # JSON 데이터를 가져오는 내부 헬퍼
             async def fetch_json(url):
                 try:
                     async with session.get(url) as res:
@@ -609,40 +581,37 @@ class MarketMakerBot:
                     pass
                 return {}
 
-            # 2. 병렬 데이터 조회 (수정된 fetch_json 사용)
-            # - 리워드 정보: Condition ID 사용
-            # - 호가창: YES Token ID 사용
+            # 2. 병렬 데이터 조회 (리워드 정보 및 YES/NO 개별 오더북)
             tasks = [
                 fetch_json(f"{self.honeypot_service.CLOB_API}/rewards/markets/{market_id}"),
-                self.honeypot_service.get_orderbook(session, yes_id)
+                self.honeypot_service.get_orderbook(session, yes_id),
+                self.honeypot_service.get_orderbook(session, no_id)
             ]
             
             responses = await asyncio.gather(*tasks)
             reward_json = responses[0]
-            orderbook = responses[1]
+            yes_book = responses[1]
+            no_book = responses[2]
 
-            vol_1h = float(orderbook.get("volatility_1h", 0.005))
+            # 변동성 추출 (YES 오더북 기준)
+            vol_1h = float(yes_book.get("volatility_1h", 0.005))
             if vol_1h >= 0.045:
                 logger.error("manual_order_blocked_unstable_market", vol_1h=vol_1h)
                 return False
 
-            # [핵심 수정] 리스트에서 직접 Best Bid/Ask 추출
-            # CLOB API 결과는 {"bids": [{"price": "0.5", "size": "100"}, ...], "asks": [...]} 형태임
-            bids = orderbook.get("bids", [])
-            asks = orderbook.get("asks", [])
-            
-            # 1. 명시적 정렬: API 응답이 정렬되어 있지 않을 경우를 대비함
-            # 매수(Bids): 가장 높은 가격이 위로 (내림차순)
-            if bids:
-                bids.sort(key=lambda x: float(x['price']), reverse=True)
-            # 매도(Asks): 가장 낮은 가격이 위로 (오름차순)
-            if asks:
-                asks.sort(key=lambda x: float(x['price']))
+            # 각 오더북에서 최우선 호가(Best Bid/Ask)를 추출하는 헬퍼
+            def get_bb_ba(book):
+                bids = book.get("bids", [])
+                asks = book.get("asks", [])
+                # 명시적 정렬로 데이터 신뢰성 확보
+                if bids: bids.sort(key=lambda x: float(x['price']), reverse=True)
+                if asks: asks.sort(key=lambda x: float(x['price']))
+                bb = float(bids[0]['price']) if bids else 0.0
+                ba = float(asks[0]['price']) if asks else 1.0
+                return bb, ba
 
-            # 2. 최우선 호가(Best Bid/Ask) 추출
-            # 정렬된 리스트의 0번째가 항상 가장 유리한 가격입니다.
-            best_bid = float(bids[0]['price']) if bids else 0.0
-            best_ask = float(asks[0]['price']) if asks else 1.0
+            y_bb, y_ba = get_bb_ba(yes_book)
+            n_bb, n_ba = get_bb_ba(no_book)
 
             # 3. 리워드 파라미터 추출
             local_spread_cents = 3
@@ -653,33 +622,46 @@ class MarketMakerBot:
                 local_spread_cents = int(float(r_data.get("rewards_max_spread", 3)))
                 min_size = float(r_data.get("rewards_min_size", 20))
 
-            # 4. 호가 생성
+            # 4. 독립적 호가 생성 (YES/NO 호가 정보를 각각 전달)
             yes_quote, no_quote = self.quote_engine.generate_quotes(
                 market_id=market_id,
-                best_bid=best_bid,
-                best_ask=best_ask,
-                yes_token_id=yes_id, 
+                yes_best_bid=y_bb,
+                yes_best_ask=y_ba,
+                no_best_bid=n_bb,
+                no_best_ask=n_ba,
+                yes_token_id=yes_id,
                 no_token_id=no_id,
                 spread_cents=local_spread_cents,
                 min_size_shares=min_size,
+                tick_size=self.current_tick_size,
+                volatility_1h=vol_1h,
                 user_input_shares=amount_usd
             )
 
-            # 5. 주문 전송
+            # 5. [요청 사항 반영] 실행 상세 정보를 로그로 출력
+            if yes_quote or no_quote:
+                y_mid = (y_bb + y_ba) / 2
+                n_mid = (n_bb + n_ba) / 2
+                y_p = yes_quote.price if yes_quote else "N/A"
+                n_p = no_quote.price if no_quote else "N/A"
+                
+                # 프론트엔드 로그 창에서 확인할 수 있는 형식
+                logger.info(f"[EXECUTED] Manual | Y_Mid: {y_mid:.3f}, N_Mid: {n_mid:.3f} | YES: {y_p} | NO: {n_p} | Shares: {amount_usd}")
+
+            # 6. 주문 전송
             success_yes = False
             success_no = False
 
-            if yes_quote: 
-                # _place_quote 내부에서 self.manual_order_ids에 추가되도록 수정됨
+            if yes_quote:
                 success_yes = await self._place_quote(yes_quote, "YES", is_manual=True)
             
-            if no_quote: 
+            if no_quote:
                 success_no = await self._place_quote(no_quote, "NO", is_manual=True)
 
-            # 7. 후처리: 성공 시 봇 활동 시간 업데이트하여 즉시 취소 방지
+            # 7. 후처리
             if success_yes or success_no:
                 logger.info("manual_safety_order_executed", market=market_id)
-                # 봇의 마지막 쿼트 시간을 현재로 갱신하여 자동 루프 지연
+                # 마지막 주문 시간을 갱신하여 자동 루프의 즉시 개입을 방지
                 self.last_quote_time = time.time() * 1000
                 return True
             else:
