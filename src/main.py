@@ -24,7 +24,7 @@ from src.risk.risk_manager import RiskManager
 from src.services import AutoRedeem, start_metrics_server
 
 # 로깅 설정
-logging.basicConfig(level=logging.INFO)
+
 logger = structlog.get_logger(__name__)
 
 class MarketMakerBot:
@@ -435,8 +435,9 @@ class MarketMakerBot:
 
     async def refresh_quotes(self):
         """
-        오더북의 변동성(vol_1h)을 계산하여 스프레드 전략에 반영하지만,
-        사용자의 전략에 따라 신규 주문 제출은 하지 않고 상태 관리만 수행합니다.
+        [개선 버전] 
+        1. 0.045 이상 시 리셋 대신 동적 스프레드 전략으로 전환
+        2. OBI 분석을 통한 독성 흐름(Toxic Flow) 사전 차단 로직 통합
         """
         # 1. 갱신 주기 확인 (API 과부하 방지)
         now_ms = time.time() * 1000
@@ -448,18 +449,22 @@ class MarketMakerBot:
         if not self.current_orderbook:
             await self.update_orderbook()
 
-        # 3. [핵심] 변동성 데이터 추출 및 쿼트 계산
-        # 오더북에서 1시간 변동성 데이터를 가져오며, 없을 경우 기본값 0.005(0.5%)를 사용합니다.
-        vol_1h = float(self.current_orderbook.get("volatility_1h", 0.005))
-        if vol_1h >= 0.045:
-            logger.warning("🚨 UNSTABLE_MARKET_DETECTED", vol_1h=vol_1h, threshold=0.045)
-            # 모든 수동 주문을 즉시 취소하고 상태를 초기화 (도망가기)
+        # 3. [독성 흐름 방어] OBI(호가 불균형) 체크
+        # 변동성이 낮더라도 호가창의 물량이 한쪽으로 쏠리면 급변동의 전조(독성 흐름)입니다.
+        risk_valid, reason = self.risk_manager.validate_obi(self.current_orderbook)
+        if not risk_valid:
+            logger.warning("🚨 TOXIC_FLOW_PRECURSOR_DETECTED", reason=reason)
+            # 위험 상황이므로 기존 주문을 모두 거두어들이고 대기합니다.
             await self._reset_local_market_state()
             return
+
+        # 4. 변동성 데이터 추출
+        vol_1h = float(self.current_orderbook.get("volatility_1h", 0.005))
         
-        # QuoteEngine은 이 vol_1h를 바탕으로 dynamic_spread를 계산합니다.
-        # 비록 자동 주문을 내지 않더라도, 현재 시장의 '적정 호가'를 계산하여 로그로 남기거나 
-        # 리스크 판단 지표(check_and_defend_orders)로 활용할 수 있습니다.
+        # [핵심 수정] 0.045 이상 시 무조건 리셋하던 if문을 제거했습니다.
+        # 이제 QuoteEngine 내부 로직에 의해 0.045 이상이면 자동으로 동적 스프레드가 계산됩니다.
+
+        # 5. 쿼트 계산 (동적 스프레드 및 스큐 적용)
         yes_q, no_q = self.quote_engine.generate_quotes(
             market_id=self.current_market_id, 
             best_bid=float(self.current_orderbook.get("best_bid", 0)),
@@ -469,18 +474,16 @@ class MarketMakerBot:
             spread_cents=self.spread_cents,
             min_size_shares=self.min_size,
             tick_size=self.current_tick_size,
-            volatility_1h=vol_1h  # [활용 지점] QuoteEngine 내부에서 스프레드 확대에 사용됨
+            volatility_1h=vol_1h 
         )
 
-        # 4. 기존 주문 정리 (Selective Cancel)
-        # 수정된 로직에 따라 manual_order_ids에 등록된 '수동 주문'은 삭제하지 않고 보호합니다.
+        # 6. 기존 주문 정리 (Selective Cancel)
+        # 계산된 쿼트 범위를 벗어난 주문이나 오래된 주문을 정리합니다.
         await self._cancel_stale_orders()
 
-        # 5. [수정] 신규 주문 제출 비활성화 (수동 모드 전용)
-        # 사용자의 요청대로 신규 주문은 수동으로만 넣기 위해 아래 자동 제출 코드는 실행하지 않습니다.
+        # 7. 신규 주문 제출 (수동 모드이므로 주석 유지)
         # if yes_q: await self._place_quote(yes_q, "YES")
-        # if no_q: await self._place_quote(no_q, "NO")
-        
+        # if no_q: await self._place_quote(no_q, "NO")        
 
     async def _place_quote(self, quote: Any, outcome: str, is_manual: bool = False):
         """

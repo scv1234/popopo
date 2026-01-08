@@ -51,18 +51,11 @@ class QuoteEngine:
         user_input_shares: float = None, 
     ) -> tuple[Quote | None, Quote | None]:
         """
-        [고도화 버전] 
-        1. 변동성에 따른 동적 스프레드 적용
-        2. 인벤토리 불균형에 따른 가격 스큐(Skewing) 적용
-        3. 보상 범위(90% 지점) 최적화 유지
+        [전략 수정 버전] 
+        1. 4.5% 미만: 보상 최적화 모드 (1.0배 고정 스프레드)
+        2. 4.5% 이상: 동적 방어 모드 (변동성 배율 적용, 최대 3.0배)
+        3. 모든 구간에서 주문 마진은 스프레드의 90% 유지
         """
-
-        # 0. 변동성 임계치 체크 (가장 먼저 실행)
-        # 1시간 변동성이 4.5%를 넘으면 시장이 매우 불안정한 것으로 간주하고 도망갑니다.
-        if volatility_1h >= 0.045:
-            logger.warning("unstable_market_detected_skipping_quotes", 
-                           vol=round(volatility_1h, 4), threshold=0.045)
-            return (None, None)
         
         # 1. 기본 주문 수량 결정
         size = user_input_shares if user_input_shares is not None else self.settings.default_size
@@ -73,63 +66,52 @@ class QuoteEngine:
         if mid_price == 0:
             return (None, None)
 
-        # 3. [고도화] 동적 스프레드 (Dynamic Spread)
-        # 변동성이 높을수록 안전 마진을 위해 스프레드를 확대합니다. (3)
-        volatility_multiplier = max(1.0, min(3.0, 1 + (volatility_1h * 100))) 
+        # 3. [핵심 로직] 변동성에 따른 배율 결정
+        if volatility_1h < 0.045:
+            # 안정적일 때는 1.0배 고정하여 보상 획득에 집중
+            volatility_multiplier = 1.0
+        else:
+            # 0.045 이상일 때는 동적 스프레드를 활성화하여 위험 회피 (최대 3.0배)
+            volatility_multiplier = max(1.0, min(3.0, 1 + (volatility_1h * 100)))
+            logger.warning("🚨 HIGH_VOLATILITY_DYNAMIC_DEFENSE", 
+                           vol=round(volatility_1h, 4), 
+                           multiplier=volatility_multiplier)
+
+        # 최종 스프레드 계산
         dynamic_spread_usd = (spread_cents * volatility_multiplier) / 100.0
 
-        # 4. [고도화] 가격 스큐 (Price Skewing)
-        # 내 지갑의 YES/NO 수량 차이를 확인하여 가격을 비틉니다.
-        # net_exposure_shares가 양수(+)면 YES가 많음 -> 주문 가격을 낮춤 (SELL 유도)
+        # 4. 가격 스큐 (Price Skewing) 유지
         inventory_diff = self.inventory_manager.inventory.net_exposure_shares
-        
-        # 스큐 강도: 1000주 차이당 0.005달러(0.5센트) 가격 이동
         skew_adjustment = (inventory_diff / 1000) * 0.005
         
-        # 보상 범위를 최대한 활용하기 위한 마진 (동적 스프레드의 90% 지점)
+        # 보상 범위 또는 방어 범위를 활용하기 위한 90% 마진 적용
         margin_usd = dynamic_spread_usd * 0.9
         
-        # [핵심] 스큐가 적용된 중간가(Skewed Mid)를 기준으로 최종 가격 산출
+        # 스큐 적용 중간가 산출
         skewed_mid = mid_price - skew_adjustment
         
-        # YES 매수가 (중간가보다 낮게)
+        # YES/NO 주문 가격 산출
         bid_price = self.round_to_tick(skewed_mid - margin_usd, tick_size)
         ask_price = self.round_to_tick(skewed_mid + margin_usd, tick_size)
         no_bid_price = self.round_to_tick(1.0 - ask_price, tick_size)
 
-        # 4. 인벤토리 상태에 따른 수량 조절 (기존 델타 뉴트럴 유지)
-        # 수량 조절과 가격 조절(Skew)이 동시에 작동하여 시너지를 냅니다.
+        # 5. 최종 Quote 생성
         yes_shares = self.inventory_manager.get_quote_size_yes(final_shares)
         no_shares = self.inventory_manager.get_quote_size_no(final_shares)
 
-        # 5. 최종 Quote 생성 및 안전 범위 검사
         yes_quote = None
         if self.inventory_manager.can_quote_yes(yes_shares) and 0.01 < bid_price < 0.99:
             yes_quote = Quote(
-                side="BUY",
-                price=bid_price,
-                size=yes_shares,
-                market=market_id,
-                token_id=yes_token_id,
+                side="BUY", price=bid_price, size=yes_shares,
+                market=market_id, token_id=yes_token_id
             )
 
         no_quote = None
         if self.inventory_manager.can_quote_no(no_shares) and 0.01 < no_bid_price < 0.99:
             no_quote = Quote(
-                side="BUY",
-                price=no_bid_price,
-                size=no_shares,
-                market=market_id,
-                token_id=no_token_id,
+                side="BUY", price=no_bid_price, size=no_shares,
+                market=market_id, token_id=no_token_id
             )
-
-        # 로그 기록 (디버깅용)
-        if yes_quote or no_quote:
-            logger.debug("quotes_generated", 
-                         skew=round(skew_adjustment, 4), 
-                         vol_mult=round(volatility_multiplier, 2),
-                         yes_p=bid_price, 
-                         no_p=no_bid_price)
 
         return (yes_quote, no_quote)
 

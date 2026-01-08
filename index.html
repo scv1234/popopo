@@ -127,6 +127,23 @@
         
         .row-selected { background-color: rgba(88, 166, 255, 0.1) !important; }
 
+        .market-cell {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            max-width: 320px;
+        }
+        .market-title-text {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            flex: 1;
+            cursor: pointer;
+        }
+        .market-title-text:hover { color: var(--blue); text-decoration: underline; }
+        .market-icon-link { flex-shrink: 0; text-decoration: none; opacity: 0.7; font-size: 14px; }
+        .market-icon-link:hover { opacity: 1; transform: scale(1.2); }
+
         .badge { padding: 4px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
         
         .profit-pos { color: #7ee787; font-weight: bold; }
@@ -256,13 +273,10 @@
     let selectedId = null;
     let marketDataMap = {};
 
-    // --- Core Functions ---
-
     async function updateStatus() {
         try {
             const res = await fetch(`${API_URL}/status`);
             const data = await res.json();
-            
             const statusBox = document.getElementById('bot-status');
             if (data.is_halted) {
                 statusBox.textContent = "🚨 HALTED (Click to Reset)";
@@ -275,7 +289,6 @@
                 statusBox.onclick = null;
                 statusBox.style.cursor = "default";
             }
-
             document.getElementById('inv-skew').textContent = data.inventory.skew.toFixed(2);
             document.getElementById('inv-net').textContent = Math.round(data.inventory.net_shares);
         } catch (e) {}
@@ -295,11 +308,8 @@
             const res = await fetch(`${API_URL}/honey-pots`);
             const data = await res.json();
             const tbody = document.getElementById('market-table');
-
             marketDataMap = {};
-            data.forEach(m => {
-                marketDataMap[m.market_id] = m;
-            });
+            data.forEach(m => { marketDataMap[m.market_id] = m; });
             
             if (data.length === 0) {
                 tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; padding: 30px; color: var(--text-muted);">No opportunities found.</td></tr>';
@@ -307,7 +317,6 @@
             }
 
             const simAmt = parseFloat(document.getElementById('sim-amount').value) || 1000;
-
             data.forEach(m => {
                 let totalPool = m.total_depth + simAmt;
                 m.estProfit = (simAmt / totalPool) * m.reward;
@@ -325,7 +334,12 @@
                 
                 html += `<tr onclick="selectMarket('${m.market_id}')" class="${isSelected}">
                     <td style="color:var(--gold); font-weight:bold;">${m.score.toFixed(1)}</td>
-                    <td><div style="font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width: 320px;">${m.title}</div></td>
+                    <td>
+                        <div style="display: flex; align-items: center; gap: 8px;">
+                            <div style="font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width: 280px;" title="${m.title}">${m.title}</div>
+                            <a href="https://polymarket.com/event/${m.slug}" target="_blank" onclick="event.stopPropagation()" style="text-decoration: none; color: var(--blue); font-size: 14px;">🔗</a>
+                        </div>
+                    </td>
                     <td style="color:var(--blue); font-weight:500;">${m.min_size}</td> 
                     <td>$${m.reward.toLocaleString()}</td>
                     <td class="${profitClass}">$${m.estProfit.toFixed(2)}</td>
@@ -340,11 +354,9 @@
 
     async function updateOrdersAndLogs() {
         try {
-            // Update Active Orders
             const res = await fetch(`${API_URL}/open-orders`);
             const orders = await res.json();
             const div = document.getElementById('open-orders');
-            
             if (orders.length === 0) {
                 div.innerHTML = '<div style="text-align:center; padding:15px; color:var(--text-muted);">No active orders</div>';
             } else {
@@ -354,7 +366,7 @@
                             <div>
                                 <span class="badge" style="background:${o.side==='BUY'?'rgba(35,134,54,0.2)':'rgba(218,54,51,0.2)'}; color:${o.side==='BUY'?'#7ee787':'#f85149'}">${o.side}</span>
                                 <b style="color:var(--gold); margin-left:5px;">${o.outcome}</b>
-                                <span style="font-weight:bold; margin-left:5px;">${parseFloat(o.size).toFixed(0)} shares</span>
+                                <span style="font-weight:bold; margin-left:5px;">${parseFloat(o.size).toFixed(0)}</span>
                             </div>
                             <button onclick="cancelById('${o.order_id}')" style="width:auto; margin:0; padding:4px 8px; font-size:11px; background:var(--red); height:24px;">Cancel</button>
                         </div>
@@ -366,12 +378,25 @@
                 `).join('');
             }
 
-            // Update Logs
+            // [핵심 수정] 중요 이벤트만 필터링하여 로그 표시
             const logRes = await fetch(`${API_URL}/logs`);
             const logs = await logRes.json();
             const logDiv = document.getElementById('logs');
-            const recentLogs = logs.slice(-50);
             
+            const filteredLogs = logs.filter(line => {
+                const upper = line.toUpperCase();
+                return upper.includes("EXECUTED") || 
+                       upper.includes("FAILED") || 
+                       upper.includes("BLOCKED") || 
+                       upper.includes("UNSTABLE") || 
+                       upper.includes("VOLATILITY") || 
+                       upper.includes("SPREAD") || 
+                       upper.includes("EMERGENCY") || 
+                       upper.includes("DEFENSIVE") || 
+                       upper.includes("CIRCUIT");
+            });
+
+            const recentLogs = filteredLogs.slice(-50);
             if (logDiv.dataset.lastLog !== JSON.stringify(recentLogs)) {
                 logDiv.innerHTML = recentLogs.map(line => `<div>${line}</div>`).join('');
                 logDiv.scrollTop = logDiv.scrollHeight;
@@ -380,13 +405,10 @@
         } catch (e) {}
     }
 
-    // --- Interaction Functions ---
-
     function selectMarket(id) {
         selectedId = id;
         document.getElementById('order-market-id').value = id;
         updateMarkets();
-        
         const btn = document.getElementById('btn-order');
         btn.textContent = "Ready to Buy";
         setTimeout(() => btn.textContent = "Place Buy Order", 1000);
@@ -396,32 +418,26 @@
         const id = document.getElementById('order-market-id').value;
         const amt = parseFloat(document.getElementById('order-amount').value);
         if(!id) return alert("Please select a market.");
-
         const marketInfo = marketDataMap[id];
         if(!confirm(`Confirm Order?\nMarket: ${id}\nAmount: $${amt}`)) return;
-
         const btn = document.getElementById('btn-order');
-        btn.textContent = "Processing...";
-        btn.disabled = true;
-
+        btn.textContent = "Processing..."; btn.disabled = true;
         try {
             const res = await fetch(`${API_URL}/place-semi-auto-order`, {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({ 
                     market_id: id, amount: amt,
-                    yes_token_id: marketInfo.yes_token_id,
-                    no_token_id: marketInfo.no_token_id
+                    yes_token_id: marketInfo.yes_token_id, no_token_id: marketInfo.no_token_id
                 })
             });
             if(res.ok) {
-                btn.style.background = "var(--accent)";
-                btn.textContent = "✅ Placed!";
+                btn.style.background = "var(--accent)"; btn.textContent = "✅ Placed!";
                 updateOrdersAndLogs();
                 setTimeout(() => { btn.textContent = "Place Buy Order"; btn.disabled = false; }, 2000);
             } else {
-                alert("Failed: " + (await res.json()).detail);
-                btn.disabled = false;
+                const err = await res.json();
+                alert("Failed: " + err.detail); btn.disabled = false;
             }
         } catch(e) { alert("Error"); btn.disabled = false; }
     }
@@ -446,18 +462,14 @@
             updateStatus();
         }
     }
-    
     function clearLogs() { document.getElementById('logs').innerHTML = ""; }
     function setSort(key) { sortKey = key; updateMarkets(); }
 
-    // --- Init ---
     setInterval(updateStatus, 1000);
     setInterval(updateMarkets, 2000);
     setInterval(updateOrdersAndLogs, 1500);
     setInterval(updateWallet, 10000);
-    
     updateStatus(); updateMarkets(); updateWallet(); updateOrdersAndLogs();
-
 </script>
 </body>
 </html>

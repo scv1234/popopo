@@ -12,10 +12,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from src.main import MarketMakerBot
 from src.config import get_settings
+from src.logging_config import configure_logging # [추가]
 from pydantic import BaseModel
 from web3 import Web3
 
 settings = get_settings()
+configure_logging(settings.log_level)
 bot = MarketMakerBot(settings)
 
 # USDC (Polygon) 컨트랙트 주소 및 최소 ABI
