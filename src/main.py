@@ -56,6 +56,7 @@ class MarketMakerBot:
         self.open_orders: dict[str, dict[str, Any]] = {}
         self.last_quote_time = 0.0
         self.trade_timestamps = []
+        self.manual_order_ids: set[str] = set()
 
         # 마켓 정보
         self.current_market_id = settings.market_id
@@ -91,7 +92,7 @@ class MarketMakerBot:
         await self.ws_client.connect()
         
         # 유저 전용 채널 구독 (체결 확인용)
-        await self.ws_client.subscribe_user(self.order_signer.get_address())
+        await self.ws_client.subscribe_user(self.order_executor.safe_address)
         
         # 마켓이 설정되었다면 오더북 구독
         if self.current_market_id:
@@ -224,22 +225,30 @@ class MarketMakerBot:
         order_id = data.get("order_id")
         
         # 1. 인벤토리 즉시 업데이트
+        # 내가 산 토큰이 YES인지 NO인지에 따라 인벤토리 수량을 가감합니다.
         yes_delta = size if token_id == self.yes_token_id and side == "BUY" else (-size if token_id == self.yes_token_id else 0)
         no_delta = size if token_id == self.no_token_id and side == "BUY" else (-size if token_id == self.no_token_id else 0)
         self.inventory_manager.update_inventory(yes_delta, no_delta)
 
         # 2. 독성 흐름(Toxic Flow) 감지
+        # 10초 이내에 너무 많은 체결(5회 이상)이 발생하면 시장이 위험하다고 판단합니다.
         now = time.time()
         self.trade_timestamps.append(now)
-        # 10초 이내 체결만 유지
         self.trade_timestamps = [t for t in self.trade_timestamps if now - t < 10]
         
         if len(self.trade_timestamps) >= 5: 
-            # 긴급 방어 트리거
+            # 긴급 방어 트리거 (포지션 유지는 False로 설정하여 일단 주문만 취소)
             asyncio.create_task(self.handle_emergency("TOXIC_FLOW_DETECTED", exit_position=False))
             return
 
-        # 3. 사후 방어 로직 (Slippage 체크 및 Auto-Hedge)
+        # 3. [핵심 추가] 관리 목록 정리
+        # 체결된 주문 ID를 수동 주문 추적 목록(manual_order_ids)과 전체 오픈 주문 목록에서 삭제합니다.
+        if order_id:
+            self.manual_order_ids.discard(order_id)
+            self.open_orders.pop(order_id, None)
+
+        # 4. 사후 방어 및 자동 포지션 복구 (Slippage 체크 및 Auto-Hedge)
+        # 이 태스크가 실행되면서 인벤토리 불균형 시 자동으로 반대 방향 주문(Hedge)을 냅니다.
         asyncio.create_task(self._defend_after_trade(actual_price, order_id))
 
     # =========================================================================
@@ -350,12 +359,17 @@ class MarketMakerBot:
             self._reset_in_progress = True
             logger.warning("resetting_market_state_start")
 
-            # 2. 주문 취소 실행
+            # 2. 거래소 주문 취소 실행
+            # 리스크 상황이므로 수동 주문 여부와 상관없이 해당 마켓의 모든 주문을 거두어들입니다.
             if self.current_market_id:
                 await self.order_executor.cancel_all_orders(self.settings.market_id)
             
-            # 3. 메모리 상의 주문 정보 클리어
+            # 3. [핵심 추가] 로컬 메모리 상태 완전 초기화
+            # 오픈 주문 목록과 수동 주문 추적 목록을 모두 비웁니다.
             self.open_orders.clear()
+            self.manual_order_ids.clear() 
+            
+            # 마지막 쿼트 시간을 리셋하여 다음 루프에서 즉시 상태를 점검할 수 있게 합니다.
             self.last_quote_time = 0
             
             logger.info("reset_market_state_complete")
@@ -420,7 +434,11 @@ class MarketMakerBot:
                 await asyncio.sleep(1)
 
     async def refresh_quotes(self):
-        # 1. 갱신 주기 확인
+        """
+        오더북의 변동성(vol_1h)을 계산하여 스프레드 전략에 반영하지만,
+        사용자의 전략에 따라 신규 주문 제출은 하지 않고 상태 관리만 수행합니다.
+        """
+        # 1. 갱신 주기 확인 (API 과부하 방지)
         now_ms = time.time() * 1000
         if (now_ms - self.last_quote_time) < self.settings.quote_refresh_rate_ms:
             return
@@ -430,10 +448,13 @@ class MarketMakerBot:
         if not self.current_orderbook:
             await self.update_orderbook()
 
-        # 3. 쿼트 계산
+        # 3. [핵심] 변동성 데이터 추출 및 쿼트 계산
+        # 오더북에서 1시간 변동성 데이터를 가져오며, 없을 경우 기본값 0.005(0.5%)를 사용합니다.
         vol_1h = float(self.current_orderbook.get("volatility_1h", 0.005))
         
-        # QuoteEngine 호출
+        # QuoteEngine은 이 vol_1h를 바탕으로 dynamic_spread를 계산합니다.
+        # 비록 자동 주문을 내지 않더라도, 현재 시장의 '적정 호가'를 계산하여 로그로 남기거나 
+        # 리스크 판단 지표(check_and_defend_orders)로 활용할 수 있습니다.
         yes_q, no_q = self.quote_engine.generate_quotes(
             market_id=self.current_market_id, 
             best_bid=float(self.current_orderbook.get("best_bid", 0)),
@@ -443,18 +464,21 @@ class MarketMakerBot:
             spread_cents=self.spread_cents,
             min_size_shares=self.min_size,
             tick_size=self.current_tick_size,
-            volatility_1h=vol_1h
+            volatility_1h=vol_1h  # [활용 지점] QuoteEngine 내부에서 스프레드 확대에 사용됨
         )
 
-        # 4. 기존 주문 정리 (Cancel)
+        # 4. 기존 주문 정리 (Selective Cancel)
+        # 수정된 로직에 따라 manual_order_ids에 등록된 '수동 주문'은 삭제하지 않고 보호합니다.
         await self._cancel_stale_orders()
 
-        # 5. 신규 주문 제출 (Place)
-        # Cancel과 Place 사이의 간격을 최소화하기 위해 같은 함수 내에서 처리
-        if yes_q: await self._place_quote(yes_q, "YES")
-        if no_q: await self._place_quote(no_q, "NO")
+        # 5. [수정] 신규 주문 제출 비활성화 (수동 모드 전용)
+        # 사용자의 요청대로 신규 주문은 수동으로만 넣기 위해 아래 자동 제출 코드는 실행하지 않습니다.
+        # if yes_q: await self._place_quote(yes_q, "YES")
+        # if no_q: await self._place_quote(no_q, "NO")
+        
+        logger.debug("quoting_cycle_monitored", vol_1h=vol_1h, market=self.current_market_id)
 
-    async def _place_quote(self, quote: Any, outcome: str):
+    async def _place_quote(self, quote: Any, outcome: str, is_manual: bool = False):
         # Risk Manager 검증 (수정된 인자 반영)
         valid, reason = self.risk_manager.validate_order(
             quote.side, quote.size, self.current_orderbook
@@ -467,11 +491,15 @@ class MarketMakerBot:
         try:
             order_data = {
                 "market": quote.market, "side": quote.side, "size": str(quote.size),
-                "price": str(quote.price), "token_id": quote.token_id
+                "price": str(quote.price), "token_id": quote.token_id,
+                "outcome": outcome
             }
             result = await self.order_executor.place_order(order_data)
             if result and "id" in result: 
                 self.open_orders[result["id"]] = order_data
+
+                if is_manual:
+                    self.manual_order_ids.add(order_id)
                 return True
         except Exception as e:
             logger.error("place_quote_failed", error=str(e))
@@ -480,12 +508,14 @@ class MarketMakerBot:
     async def _cancel_stale_orders(self):
         """현재 열려있는 모든 주문을 취소 (Batch Cancel 권장)"""
         if self.open_orders:
-            # open_orders의 ID 목록만 추출
-            order_ids = list(self.open_orders.keys())
-            if order_ids:
-                # OrderExecutor에 batch_cancel_orders 구현이 있다면 그것을 사용 권장
-                await self.order_executor.cancel_all_orders(self.current_market_id)
-            self.open_orders.clear()
+            # 수동 주문 목록에 없는 ID만 골라냄
+            stale_ids = [oid for oid in self.open_orders.keys() if oid not in self.manual_order_ids]
+        
+            if stale_ids:
+                # 전체 취소가 아닌 선택적 일괄 취소 사용
+                await self.order_executor.batch_cancel_orders(stale_ids)
+                for oid in stale_ids:
+                    self.open_orders.pop(oid, None)
 
     # =========================================================================
     # 6. Helper Services (Auto Redeem & Safety Order)
@@ -590,16 +620,17 @@ class MarketMakerBot:
             success_no = False
 
             if yes_quote: 
-                success_yes = await self._place_quote(yes_quote, "YES")
-            else:
-                # 호가 생성 실패 시 원인 로그 (디버깅용)
-                logger.warning("quote_gen_failed_yes", bid=best_bid, ask=best_ask, mid=(best_bid+best_ask)/2)
-
+                # _place_quote 내부에서 self.manual_order_ids에 추가되도록 수정됨
+                success_yes = await self._place_quote(yes_quote, "YES", is_manual=True)
+            
             if no_quote: 
-                success_no = await self._place_quote(no_quote, "NO")
+                success_no = await self._place_quote(no_quote, "NO", is_manual=True)
 
+            # 7. 후처리: 성공 시 봇 활동 시간 업데이트하여 즉시 취소 방지
             if success_yes or success_no:
                 logger.info("manual_safety_order_executed", market=market_id)
+                # 봇의 마지막 쿼트 시간을 현재로 갱신하여 자동 루프 지연
+                self.last_quote_time = time.time() * 1000
                 return True
             else:
                 logger.error("manual_order_all_failed", market=market_id)
@@ -608,6 +639,43 @@ class MarketMakerBot:
         except Exception as e:
             logger.error("manual_order_exception", error=str(e))
             return False
+
+    async def cancel_manual_order_by_outcome(self, outcome: str) -> bool:
+        """YES 또는 NO 주문을 찾아 개별 취소합니다."""
+        target_id = None
+        # 현재 열린 수동 주문 중 해당 outcome(YES/NO)을 찾습니다.
+        for oid in list(self.manual_order_ids):
+            order_info = self.open_orders.get(oid)
+            if order_info and order_info.get("outcome") == outcome:
+                target_id = oid
+                break
+        
+        if target_id:
+            logger.info(f"cancelling_specific_manual_order", outcome=outcome, id=target_id)
+            # OrderExecutor의 cancel_order(개별 취소) 사용
+            success = await self.order_executor.cancel_order(target_id)
+            if success:
+                self.manual_order_ids.discard(target_id)
+                self.open_orders.pop(target_id, None)
+                return True
+        return False
+
+    async def batch_cancel_manual_orders(self) -> bool:
+        """모든 수동 주문을 일괄 취소합니다."""
+        if not self.manual_order_ids:
+            return True
+            
+        order_ids = list(self.manual_order_ids)
+        logger.info("batch_cancelling_manual_orders", count=len(order_ids))
+        
+        # OrderExecutor의 batch_cancel_orders(일괄 취소) 사용
+        success = await self.order_executor.batch_cancel_orders(order_ids)
+        if success:
+            for oid in order_ids:
+                self.manual_order_ids.discard(oid)
+                self.open_orders.pop(oid, None)
+            return True
+        return False        
 
 
 # =========================================================================

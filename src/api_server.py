@@ -168,6 +168,19 @@ async def get_open_orders():
         })
     return orders
 
+@app.post("/cancel-manual-outcome")
+async def cancel_outcome(payload: dict):
+    outcome = payload.get("outcome") # "YES" 또는 "NO"
+    success = await bot.cancel_manual_order_by_outcome(outcome)
+    if not success:
+        raise HTTPException(status_code=404, detail=f"No active manual {outcome} order found")
+    return {"status": "success"}
+
+@app.post("/batch-cancel-manual")
+async def batch_cancel_manual():
+    success = await bot.batch_cancel_manual_orders()
+    return {"status": "success" if success else "failed"}    
+
 @app.get("/logs")
 async def get_logs():
     """최근 로그 20줄"""

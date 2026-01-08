@@ -13,8 +13,10 @@
             --text: #c9d1d9; 
             --text-muted: #8b949e;
             --red: #da3633; 
+            --red-hover: #f85149;
             --gold: #e2b93d; 
             --blue: #58a6ff;
+            --gray: #6e7681;
         }
         body { 
             background-color: var(--bg); 
@@ -25,7 +27,6 @@
             font-size: 14px;
         }
         
-        /* 레이아웃: 2단 구성 (사이드바 280px / 메인 나머지) */
         .container { 
             display: grid; 
             grid-template-columns: 280px 1fr; 
@@ -34,7 +35,6 @@
             margin: 0 auto; 
         }
 
-        /* 패널 스타일 */
         .panel { 
             background: var(--panel); 
             border: 1px solid var(--border); 
@@ -63,13 +63,11 @@
             gap: 8px;
         }
 
-        /* 상태 박스 */
         .status-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
         .stat-box { background: #21262d; padding: 12px; border-radius: 6px; text-align: center; }
         .stat-val { font-size: 18px; font-weight: 700; display: block; margin-bottom: 4px; color: var(--text); }
         .stat-label { font-size: 12px; color: var(--text-muted); }
 
-        /* 입력 폼 */
         label { display: block; font-size: 12px; color: var(--text-muted); margin-bottom: 6px; margin-top: 12px; }
         input[type="text"], input[type="number"] { 
             background: #0d1117; 
@@ -92,21 +90,23 @@
             cursor: pointer; 
             font-weight: 600; 
             border-radius: 6px; 
-            margin-top: 15px;
+            margin-top: 10px;
             transition: background 0.2s;
         }
         button:hover { background: var(--accent-hover); }
+        
+        .btn-red { background: var(--red); }
+        .btn-red:hover { background: var(--red-hover); }
+        .btn-gray { background: var(--gray); }
+        .btn-gray:hover { opacity: 0.8; }
 
-        /* [수정됨] 테이블 스크롤 래퍼 */
         .table-wrapper {
-            max-height: 600px; /* 여기서 테이블 높이 조절 */
-            overflow-y: auto;  /* 세로 스크롤바 생성 */
+            max-height: 600px;
+            overflow-y: auto;
         }
 
-        /* 테이블 */
         table { width: 100%; border-collapse: collapse; font-size: 13px; }
         
-        /* [수정됨] 헤더 고정 (Sticky Header) */
         th { 
             text-align: left; 
             color: var(--text-muted); 
@@ -114,11 +114,9 @@
             border-bottom: 1px solid var(--border); 
             font-weight: 500;
             cursor: pointer;
-            
-            /* 스크롤 시 헤더 고정 */
             position: sticky;
             top: 0;
-            background: var(--panel); /* 스크롤되는 글자가 비치지 않게 배경색 지정 */
+            background: var(--panel);
             z-index: 10;
         }
         
@@ -129,7 +127,6 @@
         
         .row-selected { background-color: rgba(88, 166, 255, 0.1) !important; }
 
-        /* 뱃지 및 유틸 */
         .badge { padding: 4px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
         .badge-green { background: rgba(35, 134, 54, 0.2); color: #7ee787; }
         .badge-blue { background: rgba(56, 139, 253, 0.15); color: #58a6ff; }
@@ -150,7 +147,6 @@
             border: 1px solid var(--border);
         }
 
-        /* 시뮬레이션 인풋 커스텀 */
         .sim-input-group { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-muted); }
         .sim-input { 
             width: 80px !important; 
@@ -161,7 +157,6 @@
             height: auto;
         }
         
-        /* 스크롤바 디자인 (크롬/사파리) */
         ::-webkit-scrollbar { width: 8px; height: 8px; }
         ::-webkit-scrollbar-track { background: var(--bg); }
         ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
@@ -203,6 +198,15 @@
             <input type="number" id="order-amount" value="100">
             
             <button onclick="placeOrder()" id="btn-order">Place Buy Order</button>
+
+            <div style="margin-top: 20px; border-top: 1px solid var(--border); padding-top: 10px;">
+                <label>Manual Order Cancellations</label>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+                    <button onclick="cancelOutcome('YES')" class="btn-red">Cancel YES</button>
+                    <button onclick="cancelOutcome('NO')" class="btn-red">Cancel NO</button>
+                </div>
+                <button onclick="batchCancelManual()" class="btn-gray">Batch Cancel Manual Orders</button>
+            </div>
         </div>
 
         <div class="panel">
@@ -308,19 +312,16 @@
 
             const simAmt = parseFloat(document.getElementById('sim-amount').value) || 1000;
 
-            // 수익률 계산
             data.forEach(m => {
                 let totalPool = m.total_depth + simAmt;
                 m.estProfit = (simAmt / totalPool) * m.reward;
             });
 
-            // 정렬
             data.sort((a,b) => {
                 if(sortKey === 'profit') return b.estProfit - a.estProfit;
                 return b.score - a.score;
             });
 
-            // [수정됨] top10 제한 제거하고 전체 리스트 사용
             const list = data; 
 
             let html = '';
@@ -345,7 +346,6 @@
     }
 
     async function updateOrdersAndLogs() {
-        // Orders
         try {
             const res = await fetch(`${API_URL}/open-orders`);
             const orders = await res.json();
@@ -366,14 +366,12 @@
             }
         } catch (e) {}
 
-        // Logs
         try {
             const res = await fetch(`${API_URL}/logs`);
             const logs = await res.json();
             const logDiv = document.getElementById('logs');
-            const recentLogs = logs.slice(-50); // 최근 50줄만
+            const recentLogs = logs.slice(-50);
             
-            // 단순 변화 감지
             if (logDiv.dataset.lastLog !== JSON.stringify(recentLogs)) {
                 logDiv.innerHTML = recentLogs.map(line => `<div>${line}</div>`).join('');
                 logDiv.scrollTop = logDiv.scrollHeight;
@@ -387,9 +385,8 @@
     function selectMarket(id) {
         selectedId = id;
         document.getElementById('order-market-id').value = id;
-        updateMarkets(); // 선택 표시 갱신
+        updateMarkets();
         
-        // 버튼 깜빡임 효과
         const btn = document.getElementById('btn-order');
         btn.textContent = "Ready to Buy";
         setTimeout(() => btn.textContent = "Place Buy Order", 1000);
@@ -418,13 +415,12 @@
                 body: JSON.stringify({ 
                     market_id: id, 
                     amount: amt,
-                    yes_token_id: marketInfo.yes_token_id, // 추가됨
-                    no_token_id: marketInfo.no_token_id    // 추가됨
+                    yes_token_id: marketInfo.yes_token_id,
+                    no_token_id: marketInfo.no_token_id
                 })
             });
             
             if(res.ok) {
-                // 성공 UI 피드백
                 btn.style.background = "var(--accent)";
                 btn.textContent = "✅ Order Placed!";
                 updateOrdersAndLogs();
@@ -442,6 +438,41 @@
             alert("Network Error");
             btn.textContent = originalText;
             btn.disabled = false;
+        }
+    }
+
+    // [추가] 개별 취소 요청 함수
+    async function cancelOutcome(outcome) {
+        if(!confirm(`Cancel manual ${outcome} order?`)) return;
+        try {
+            const res = await fetch(`${API_URL}/cancel-manual-outcome`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ outcome })
+            });
+            if(res.ok) {
+                updateOrdersAndLogs();
+            } else {
+                const err = await res.json();
+                alert("Cancel failed: " + err.detail);
+            }
+        } catch(e) {
+            alert("Network error occurred during cancellation.");
+        }
+    }
+
+    // [추가] 일괄 취소 요청 함수
+    async function batchCancelManual() {
+        if(!confirm("Cancel ALL manual orders?")) return;
+        try {
+            const res = await fetch(`${API_URL}/batch-cancel-manual`, { method: 'POST' });
+            if(res.ok) {
+                updateOrdersAndLogs();
+            } else {
+                alert("Batch cancellation failed.");
+            }
+        } catch(e) {
+            alert("Network error occurred during batch cancellation.");
         }
     }
 

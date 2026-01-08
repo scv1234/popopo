@@ -17,21 +17,23 @@ class OrderExecutor:
         self.settings = settings
         self.order_signer = order_signer
         
-        # 1. ClobClient 초기화 (address 인자 제거)
+        # 2. ClobClient 생성자 수정
+        # [핵심] funder에 EOA 주소가 아닌 'Safe 지갑 주소'를 넣어야 합니다.
+        # signature_type=2는 Safe 지갑을 의미합니다.
         self.client = ClobClient(
             host=settings.polymarket_api_url,
             key=self.order_signer.get_private_key(),
             chain_id=137,
-            signature_type=2, 
-            funder=self.order_signer.get_address()
+            signature_type=2,                  # 정수 2 직접 입력
+            funder=settings.public_address     # [수정] EOA 대신 Safe 주소 입력
         )
         
-        # 2. Proxy(Safe) 지갑 주소를 객체 속성에 직접 설정
-        # 이렇게 해야 SDK가 주문의 maker 주소를 Safe 주소로 올바르게 인식합니다.
+        # 3. 객체 속성 일치 (SDK 내부 상태 동기화)
         if settings.public_address:
             self.client.address = settings.public_address
             
         self.safe_address = settings.public_address
+        logger.info("✅ ClobClient Initialized for Safe", address=self.safe_address)
 
     async def initialize(self):
         """API 자격 증명 유도 및 설정 (L2 인증)"""
