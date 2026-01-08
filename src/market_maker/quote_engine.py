@@ -30,6 +30,13 @@ class QuoteEngine:
             return 0.0
         return (best_bid + best_ask) / 2.0
 
+    def round_to_tick(self, price: float, tick_size: float) -> float:
+        """시장의 최소 단위(tick_size)에 맞춰 가격을 반올림합니다."""
+        if tick_size <= 0: return round(price, 2)
+        # 예: tick_size가 0.01이면 소수점 2자리, 0.001이면 3자리로 계산
+        precision = int(-math.log10(tick_size))
+        return round(math.floor(price / tick_size) * tick_size, precision)    
+
     def generate_quotes(
         self, 
         market_id: str, 
@@ -39,6 +46,7 @@ class QuoteEngine:
         no_token_id: str, 
         spread_cents: float,
         min_size_shares: float,
+        tick_size: float = 0.01, # 기본값 설정
         volatility_1h: float = 0.005,         # [고도화] 변동성 인자 추가
         user_input_shares: float = None, 
     ) -> tuple[Quote | None, Quote | None]:
@@ -78,12 +86,9 @@ class QuoteEngine:
         skewed_mid = mid_price - skew_adjustment
         
         # YES 매수가 (중간가보다 낮게)
-        bid_price = round(skewed_mid - margin_usd, 3)
-        # YES 매도가 (중간가보다 높게)
-        ask_price = round(skewed_mid + margin_usd, 3)
-        
-        # NO 토큰의 매수 가격은 (1 - YES 매도가)
-        no_bid_price = round(1.0 - ask_price, 3)
+        bid_price = self.round_to_tick(skewed_mid - margin_usd, tick_size)
+        ask_price = self.round_to_tick(skewed_mid + margin_usd, tick_size)
+        no_bid_price = self.round_to_tick(1.0 - ask_price, tick_size)
 
         # 4. 인벤토리 상태에 따른 수량 조절 (기존 델타 뉴트럴 유지)
         # 수량 조절과 가격 조절(Skew)이 동시에 작동하여 시너지를 냅니다.

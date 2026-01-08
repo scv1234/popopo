@@ -17,15 +17,20 @@ class OrderExecutor:
         self.settings = settings
         self.order_signer = order_signer
         
-        # SDK 클라이언트 초기화
-        # key: 서명용 개인키, funder: 가스비 및 권한용 EOA 주소
+        # 1. ClobClient 초기화 (address 인자 제거)
         self.client = ClobClient(
             host=settings.polymarket_api_url,
             key=self.order_signer.get_private_key(),
             chain_id=137,
-            signature_type=2, # EOA 서명 방식
+            signature_type=2, 
             funder=self.order_signer.get_address()
         )
+        
+        # 2. Proxy(Safe) 지갑 주소를 객체 속성에 직접 설정
+        # 이렇게 해야 SDK가 주문의 maker 주소를 Safe 주소로 올바르게 인식합니다.
+        if settings.public_address:
+            self.client.address = settings.public_address
+            
         self.safe_address = settings.public_address
 
     async def initialize(self):
@@ -44,25 +49,38 @@ class OrderExecutor:
             logger.error("❌ CLOB Auth Failed", error=str(e))
             raise
 
-    async def create_order(self, order_params: Dict[str, Any]) -> Optional[Dict]:
-        """주문 생성 및 전송"""
+    async def place_order(self, order_params: Dict[str, Any]) -> Optional[Dict]:
+        """주문 생성 (main.py의 'token_id'와 'id' 기대치 충족)"""
         try:
+            # 변수명 통일: main.py에서 보내는 token_id를 사용
             order_args = OrderArgs(
-                token_id=order_params["tokenId"],
+                token_id=order_params["token_id"], 
                 price=float(order_params["price"]),
                 size=float(order_params["size"]),
                 side=order_params["side"].upper()
             )
 
-            # SDK 내부에서 EIP-712 서명 생성 및 POST 요청 수행
             signed_order = self.client.create_order(order_args)
             result = self.client.post_order(signed_order, OrderType.GTC)
             
-            logger.info("✅ Order Placed Success", order_id=result.get("orderID"))
+            # main.py 호환성: 'orderID'를 'id'로 복사하여 반환
+            if result and "orderID" in result:
+                result["id"] = result["orderID"]
+            
             return result
         except Exception as e:
-            logger.error("❌ Order Creation Failed", error=str(e))
+            logger.error("❌ Order Placement Failed", error=str(e))
             return None
+
+    async def place_market_order(self, market_id: str, side: str, size: float, token_id: str) -> Optional[Dict]:
+        """긴급 청산용 주문 (유리한 가격으로 지정가 주문 제출)"""
+        price = 0.99 if side == "BUY" else 0.01
+        return await self.place_order({
+            "side": side,
+            "size": size,
+            "price": price,
+            "token_id": token_id
+        })
 
     async def get_usdc_balance(self) -> float:
         """현재 계정의 USDC 잔고 조회"""
@@ -98,8 +116,8 @@ class OrderExecutor:
             logger.error("❌ Batch Cancel Failed", error=str(e))
             return 0
 
-    async def cancel_all_orders(self) -> bool:
-        """모든 미결제 주문 취소"""
+    async def cancel_all_orders(self, market_id: str = None) -> bool:
+        """모든 주문 취소 (인자 허용하여 main.py와 호환성 유지)"""
         try:
             self.client.cancel_all()
             logger.info("✅ All Orders Cancelled")

@@ -63,6 +63,7 @@ class MarketMakerBot:
         self.no_token_id = ""
         self.spread_cents = 3
         self.min_size = 20.0
+        self.current_tick_size = 0.01 # 기본값
 
     # =========================================================================
     # 1. Lifecycle & Bootstrap (봇의 시작과 종료)
@@ -152,30 +153,38 @@ class MarketMakerBot:
             # 1. 이전 마켓 정리
             old_market_id = self.current_market_id
             if old_market_id:
-                # 이전 마켓 주문 취소
                 await self.order_executor.cancel_all_orders(old_market_id)
                 self.open_orders.clear()
-                # (선택 사항) 웹소켓 구독 해제 로직이 있다면 여기서 호출
 
-            # 2. 로컬 상태 변수 업데이트 (Atomic에 가깝게)
+            # 2. 로컬 상태 변수 업데이트
             self.current_market_id = market_data['market_id']
             self.yes_token_id = market_data['yes_token_id']
             self.no_token_id = market_data['no_token_id']
             self.min_size = market_data['min_size']
             self.spread_cents = market_data.get('spread_cents', 3)
-            
+        
             # 상태 초기화
             self.current_orderbook = {}
             self.last_quote_time = 0.0
-            self.risk_manager.is_halted = False # 새 마켓에서는 리셋
+            self.risk_manager.is_halted = False 
 
-            # 3. 새로운 마켓 구독
-            if self.ws_client.running: # 연결된 상태라면
+            # 3. 새로운 마켓 구독 및 데이터 동기화
+            if self.ws_client.running:
                 await self.ws_client.subscribe_orderbook(self.current_market_id)
-                await self.update_orderbook() # 스냅샷 즉시 로드 시도
+                await self.update_orderbook()
+
+            # [핵심] 해당 마켓의 틱 사이즈 정보를 동적으로 가져옴
+            try:
+                # SDK의 get_tick_size는 문자열(예: "0.01")을 직접 반환합니다.
+                tick_size_str = self.order_executor.client.get_tick_size(self.yes_token_id)
+                self.current_tick_size = float(tick_size_str)
+                logger.info("✅ Market Tick Size Updated", tick=self.current_tick_size)
+            except Exception as e:
+                # 오타('token_info')가 나지 않도록 직접 tick_size_str 사용
+                logger.warning(f"⚠️ Failed to fetch tick size ({e}), using default 0.01")
+                self.current_tick_size = 0.01 
 
         if use_lock:
-            # Lock을 획득하여 다른 루프(cancel_replace)가 끼어들지 못하게 함
             async with self.state_lock:
                 await _critical_section()
         else:
@@ -433,6 +442,7 @@ class MarketMakerBot:
             no_token_id=self.no_token_id,
             spread_cents=self.spread_cents,
             min_size_shares=self.min_size,
+            tick_size=self.current_tick_size,
             volatility_1h=vol_1h
         )
 
