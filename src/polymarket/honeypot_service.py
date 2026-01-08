@@ -29,13 +29,17 @@ class HoneypotService:
         self._session = None # [필수 추가] AttributeError 해결을 위한 초기화
 
     async def get_session(self):
-        """[개선] User-Agent 헤더를 추가하여 API 차단(403/429)을 방지합니다."""
+        """타임아웃 설정을 추가하여 세션을 생성합니다."""
         if self._session is None or self._session.closed:
+            # 전체 요청 타임아웃을 10초로 제한
+            timeout = aiohttp.ClientTimeout(total=20, connect=10) 
             headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "User-Agent": "Mozilla/5.0 ...",
                 "Accept": "application/json"
             }
-            self._session = aiohttp.ClientSession(headers=headers)
+            # 커넥션 풀 제한을 늘려 동시 요청 효율 향상
+            connector = aiohttp.TCPConnector(limit=100, keepalive_timeout=30)
+            self._session = aiohttp.ClientSession(headers=headers, timeout=timeout, connector=connector)
         return self._session
 
     async def close(self):
@@ -45,21 +49,18 @@ class HoneypotService:
     async def get_orderbook(self, session, token_id: str):
         """[수정] 404(오더북 없음)는 에러가 아닌 자연스러운 현상으로 처리"""
         url = f"{self.CLOB_API}/book?token_id={token_id}"
-        try:
-            async with session.get(url) as res:
-                if res.status == 200:
-                    return await res.json()
-                elif res.status == 404:
-                    # [변경] 404는 단순히 '호가 없음'이므로 에러 로그를 찍지 않고 무시
-                    return {}
-                else:
-                    # 404 외의 진짜 에러(429, 500 등)만 로그 출력
-                    text = await res.text()
-                    logger.error(f"❌ get_orderbook API Error: {res.status} | {text[:100]} | token_id={token_id}")
-                    return {}
-        except Exception as e:
-            logger.error(f"❌ get_orderbook Exception: {e}")
-            return {}
+        retries = 3
+        for i in range(retries):
+            try:
+                async with session.get(url, timeout=5) as res:
+                    if res.status == 200:
+                        return await res.json()
+                    elif res.status == 429: # 속도 제한 시 대기
+                        await asyncio.sleep(1)
+            except Exception:
+                if i == 2: logger.debug(f"Orderbook fetch final failure: {token_id}")
+                await asyncio.sleep(0.5)
+        return {}
 
     async def get_price_history(self, session, token_id: str):
         """최근 24시간 가격 히스토리 조회 (CLOB API)"""

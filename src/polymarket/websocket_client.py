@@ -17,59 +17,72 @@ class PolymarketWebSocketClient:
         self.settings = settings
         self.ws_url = settings.polymarket_ws_url.strip().replace('"', '').replace("'", "")
         self.websocket = None
-        self.message_handlers: dict[str, Callable] = {}
+        self.message_handlers = {}
         self.running = False
-        # [수정] 채널별로 최신 구독 메시지만 관리하기 위해 dict로 변경
-        self._subscriptions: dict[str, str] = {} 
+        self._subscriptions = {} # 모든 구독 정보를 저장
 
     def register_handler(self, message_type: str, handler: Callable):
         self.message_handlers[message_type] = handler
 
     async def _send_subscribe(self, message: dict):
-        """[추가] 메시지를 전송하고 구독 목록에 저장하는 헬퍼 함수"""
-        if not self.websocket or not self.running:
+        if not self.websocket:
             await self.connect()
-            
-        msg_str = json.dumps(message)
-        # 채널(및 마켓)을 키로 사용하여 중복 구독 방지 및 최신화
-        # 예: "l2_book:market_id" 또는 "user"
-        sub_key = f"{message['channel']}:{message.get('market', '')}"
-        self._subscriptions[sub_key] = msg_str
-        
-        await self.websocket.send(msg_str)
+
+        # 채널 키 생성
+        channel = message.get('channel') or (message.get('channels')[0] if message.get('channels') else 'unknown')
+        market = message.get('market') or (message.get('assets_ids')[0] if message.get('assets_ids') else '')
+        sub_key = f"{channel}:{market}"
+    
+        self._subscriptions[sub_key] = message
+    
+        # [수정] hasattr과 'in' 연산자를 사용하여 모든 버전의 websockets 라이브러리에 대응
+        is_connected = False
+        if self.websocket:
+            if hasattr(self.websocket, 'closed'):
+                is_connected = not self.websocket.closed
+            elif hasattr(self.websocket, 'open'):
+                is_connected = self.websocket.open
+            else:
+                # [오류 수정] .contains('OPEN') -> "OPEN" in ...
+                state_str = str(getattr(self.websocket, 'state', ''))
+                is_connected = "OPEN" in state_str
+
+        if is_connected:
+            try:
+                await self.websocket.send(json.dumps(message))
+            except Exception as e:
+                logger.error("websocket_send_failed", error=str(e))
+                await self.connect()
+                await self.websocket.send(json.dumps(message))
+        else:
+            logger.warning("websocket_not_ready_reconnecting")
+            await self.connect()
+            if self.websocket:
+                await self.websocket.send(json.dumps(message))
 
     async def connect(self):
         try:
-            # ping_interval/timeout 설정으로 연결 유지력 강화
-            self.websocket = await websockets.connect(
-                self.ws_url,
-                ping_interval=20,
-                ping_timeout=20
-            )
+            if self.websocket: await self.websocket.close()
+            self.websocket = await websockets.connect(self.ws_url, ping_interval=20, ping_timeout=20)
             self.running = True
             
-            # [수정] 저장된 구독 정보가 있다면 재연결 즉시 복구
+            # 저장된 모든 채널(오더북 포함) 재구독
             if self._subscriptions:
-                logger.info("resubscribing_to_previous_channels", count=len(self._subscriptions))
                 for sub_msg in self._subscriptions.values():
-                    await self.websocket.send(sub_msg)
-            
-            logger.info("websocket_connected_successfully")
+                    await self.websocket.send(json.dumps(sub_msg))
+            logger.info("websocket_connected_and_resubscribed")
         except Exception as e:
             logger.error("websocket_connection_failed", error=str(e))
             raise
 
     async def subscribe_orderbook(self, market_id: str):
-        if not self.websocket:
-            await self.connect()
-
-        # TS 코드와 동일한 규격으로 변경
+        """저장 로직을 위해 _send_subscribe를 사용하도록 수정"""
         message = {
             "type": "subscribe",
-            "assets_ids": [market_id],  # market -> assets_ids (리스트 형태)
-            "channels": ["order_book_l2"], # l2_book -> order_book_l2
+            "assets_ids": [market_id],
+            "channels": ["order_book_l2"],
         }
-        await self.websocket.send(json.dumps(message))
+        await self._send_subscribe(message)
         logger.info("orderbook_subscribed_ts_style", market_id=market_id)
 
     async def subscribe_trades(self, market_id: str):
@@ -93,37 +106,19 @@ class PolymarketWebSocketClient:
         logger.info("user_channel_subscribed", address=user_address)
 
     async def listen(self):
-        if not self.websocket:
-            await self.connect()
-
-        while self.running:
+        await self.connect()
+        while True: # 루프가 절대 죽지 않도록 설정
             try:
                 message = await self.websocket.recv()
-                
-                # [수정] 빈 메시지 또는 공백만 있는 메시지 무시
-                if not message or not message.strip():
-                    continue
-
-                data = json.loads(message.strip())
-
-                message_type = data.get("type") or data.get("event_type") # 규격 대응
-                if message_type and message_type in self.message_handlers:
-                    await self.message_handlers[message_type](data)
-
-            except websockets.exceptions.ConnectionClosed:
-                logger.warning("websocket_connection_closed_reconnecting")
-                self.running = False # 잠시 중단 후 connect에서 다시 True가 됨
-                await asyncio.sleep(5)
-                try:
-                    await self.connect()
-                except Exception:
-                    continue # 재연결 실패 시 다음 루프에서 다시 시도
-            except json.JSONDecodeError:
-                # JSON 형식이 아닌 메시지는 로그만 남기고 무시
-                continue
+                data = json.loads(message)
+                m_type = data.get("type") or data.get("event_type")
+                if m_type in self.message_handlers:
+                    await self.message_handlers[m_type](data)
             except Exception as e:
-                logger.error("websocket_listen_error", error=str(e))
-                await asyncio.sleep(1)
+                logger.warning("websocket_error_reconnecting", error=str(e))
+                await asyncio.sleep(5)
+                try: await self.connect()
+                except: continue
 
     async def close(self):
         self.running = False

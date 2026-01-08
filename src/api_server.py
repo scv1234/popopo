@@ -13,12 +13,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.main import MarketMakerBot
 from src.config import get_settings
 from src.logging_config import configure_logging # [추가]
+from src.polymarket.honeypot_service import HoneypotService  # [연동]
 from pydantic import BaseModel
 from web3 import Web3
 
 settings = get_settings()
 configure_logging(settings.log_level)
 bot = MarketMakerBot(settings)
+honeypot_service = HoneypotService(settings)
 
 # USDC (Polygon) 컨트랙트 주소 및 최소 ABI
 USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
@@ -26,6 +28,17 @@ ERC20_ABI = [
     {"constant": True, "inputs": [{"name": "_owner", "type": "address"}], "name": "balanceOf", "outputs": [{"name": "balance", "type": "uint256"}], "type": "function"},
     {"constant": True, "inputs": [], "name": "decimals", "outputs": [{"name": "", "type": "uint8"}], "type": "function"}
 ]
+
+async def run_honeypot_scanner():
+    """배경 작업: 10분마다 폴리마켓을 스캔하여 DB를 갱신합니다."""
+    while True:
+        try:
+            print("🔍 [Scanner] 주기적 시장 스캔 시작...")
+            await honeypot_service.scan()
+            print("✅ [Scanner] 시장 스캔 및 DB 갱신 완료.")
+        except Exception as e:
+            print(f"❌ [Scanner] 스캔 중 오류 발생: {e}")
+        await asyncio.sleep(600) # 10분 대기
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -52,20 +65,109 @@ class OrderRequest(BaseModel):
     yes_token_id: str
     no_token_id: str
 
-@app.get("/honey-pots")
-def get_honey_pots():
-    """DB에서 꿀통 데이터를 읽어옵니다."""
-    conn = sqlite3.connect('bot_data.db')
-    cursor = conn.cursor()
+def load_honeypots_from_db():
+    """HoneypotService가 저장한 SQLite DB에서 데이터를 로드합니다."""
     try:
-        cursor.execute('CREATE TABLE IF NOT EXISTS honeypots (id TEXT PRIMARY KEY, data TEXT, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)')
+        conn = sqlite3.connect('bot_data.db')
+        cursor = conn.cursor()
         cursor.execute('SELECT data FROM honeypots')
         rows = cursor.fetchall()
-        return [json.loads(row[0]) for row in rows]
-    except Exception:
-        return []
-    finally:
         conn.close()
+        return [json.loads(row[0]) for row in rows]
+    except Exception as e:
+        print(f"❌ DB 조회 실패: {e}")
+        return []
+
+def calculate_actual_mid(token_id, fallback_price=0.5):
+    """실시간 오더북 리스트에서 최우선 호가를 찾아 중간가를 계산합니다."""
+    if not token_id: return fallback_price
+    
+    # 1. 봇의 메모리에 있는 실시간 오더북 확인
+    book = bot.orderbooks.get(token_id, {})
+    
+    # L2 Book 데이터 구조(리스트)에서 가격 추출
+    bids = book.get("bids", [])
+    asks = book.get("asks", [])
+    
+    if bids and asks:
+        try:
+            # bids[0][0] 또는 bids[0]['price'] 형태 대응
+            best_bid = float(bids[0][0] if isinstance(bids[0], list) else bids[0].get('price', 0))
+            best_ask = float(asks[0][0] if isinstance(asks[0], list) else asks[0].get('price', 0))
+            
+            if best_bid > 0 and best_ask > 0:
+                return round((best_bid + best_ask) / 2.0, 3)
+        except Exception:
+            pass
+
+    # 2. 실시간 데이터가 없으면 DB에 저장된 스캔 당시 가격 사용
+    try:
+        conn = sqlite3.connect('bot_data.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT data FROM honeypots WHERE id = (SELECT id FROM honeypots WHERE data LIKE ? LIMIT 1)", (f'%{token_id}%',))
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row:
+            m_data = json.loads(row[0])
+            if m_data.get("yes_token_id") == token_id:
+                return m_data.get("mid_yes", fallback_price)
+            return m_data.get("mid_no", fallback_price)
+    except:
+        pass
+
+    return fallback_price
+
+@app.get("/honey-pots")
+async def get_honey_pots():
+    """DB 데이터와 실시간 봇 데이터를 병합하여 반환합니다."""
+    db_markets = load_honeypots_from_db()
+    if not db_markets:
+        return []
+
+    results = []
+    for m in db_markets:
+        y_id = m.get("yes_token_id")
+        n_id = m.get("no_token_id")
+        
+        # 기본값은 DB에 저장된 당시의 mid 값을 사용 (0.5 방지)
+        mid_yes = m.get("mid_yes", 0.5)
+        mid_no = m.get("mid_no", 0.5)
+
+        # 봇이 실시간 데이터를 가지고 있는지 확인
+        for tid, current_mid in [(y_id, "mid_yes"), (n_id, "mid_no")]:
+            book = bot.orderbooks.get(tid, {})
+            bids = book.get("bids", [])
+            asks = book.get("asks", [])
+
+            if bids and asks:
+                try:
+                    # 폴리마켓 데이터 구조: [[가격, 수량], [가격, 수량], ...]
+                    # 첫 번째 요소의 0번 인덱스가 가격입니다.
+                    best_bid = float(bids[0][0] if isinstance(bids[0], list) else bids[0].get('price', 0))
+                    best_ask = float(asks[0][0] if isinstance(asks[0], list) else asks[0].get('price', 0))
+                    
+                    if best_bid > 0 and best_ask > 0:
+                        if current_mid == "mid_yes": mid_yes = round((best_bid + best_ask) / 2.0, 3)
+                        else: mid_no = round((best_bid + best_ask) / 2.0, 3)
+                except (IndexError, TypeError, ValueError):
+                    continue
+
+        results.append({
+            "market_id": m.get("market_id"),
+            "title": m.get("title"),
+            "slug": m.get("slug"),
+            "mid_yes": mid_yes,
+            "mid_no": mid_no,
+            "score": m.get("score"),
+            "total_depth": m.get("total_depth"),
+            "reward": m.get("reward"),
+            "min_size": m.get("min_size", 20),
+            "spread_cents": m.get("spread_cents", 3),
+            "yes_token_id": y_id,
+            "no_token_id": n_id
+        })
+    return results
 
 @app.get("/status")
 async def get_status():
@@ -209,7 +311,7 @@ async def cancel_order(order_id: str):
 @app.get("/recommend-allocation")
 async def recommend_allocation(total_budget: float = 1000.0):
     # 1. 현재 꿀통 데이터 가져오기
-    pots = get_honey_pots() # DB에서 로드
+    pots = await get_honey_pots()  # 비동기 호출 수정
     if not pots: return {"error": "No market data available"}
 
     # 2. 시뮬레이션 (Greedy 알고리즘)
