@@ -28,13 +28,13 @@ class RiskManager:
         bids = orderbook.get("bids", [])
         asks = orderbook.get("asks", [])
         
-        if not bids or not asks: return True, "OK"
+        if not bids or not asks: return False, "EMPTY_ORDERBOOK"
 
         # 최상단 호가 물량 합산
         bid_vol = sum(float(b[1]) for b in bids[:3])
         ask_vol = sum(float(a[1]) for a in asks[:3])
         
-        if (bid_vol + ask_vol) == 0: return True, "OK"
+        if (bid_vol + ask_vol) == 0: return False, "NO_LIQUIDITY"
         
         obi = (bid_vol - ask_vol) / (bid_vol + ask_vol)
         
@@ -95,5 +95,6 @@ class RiskManager:
         self.is_leg_risk_active = False
         self.min_recovery_price = 0.0
         logger.info("🔄 RISK_MANAGER_RESET_SUCCESS")
+
 
 
