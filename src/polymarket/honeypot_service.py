@@ -16,8 +16,8 @@ class HoneypotService:
         self.params = {
             "min_daily_reward_usd": settings.min_daily_reward_usd if settings else 10,
             "max_existing_depth_usd": getattr(settings, 'max_existing_depth_usd', 5000),
-            "min_mid_price": getattr(settings, 'min_mid_price', 0.15),
-            "max_mid_price": getattr(settings, 'max_mid_price', 0.85),
+            "min_mid_price": getattr(settings, 'min_mid_price', 0.40),
+            "max_mid_price": getattr(settings, 'max_mid_price', 0.60),
             "max_order_size_shares": 200,
             "avoid_near_expiry_hours": 10,
             "max_concurrent": 40,
@@ -280,6 +280,9 @@ class HoneypotService:
         if total_depth > self.params["max_existing_depth_usd"]: 
             return None
 
+        if volatility_1h > 0.007:  # 1시간 변동성이 0.7센트 이상이면 제외 (매우 보수적 기준)
+            return None
+
         # (1) Base Yield: $1,000 투입 시 지분 대비 수익 (최소 분모 $1,000 설정)
         yield_score = (daily_reward / max(total_depth, 1000)) * 1000
 
@@ -289,7 +292,8 @@ class HoneypotService:
         price_safety = math.exp(- (dist_from_mid ** 2) / (2 * (0.15 ** 2)))
 
         # (3) Volatility Safety: 변동성이 작을수록 안전 (역수 감쇠)
-        vol_safety = 1 / (1 + (volatility * 50))
+        short_vol_safety = 1 / (1 + (volatility_1h * 200)) 
+        vol_safety = (1 / (1 + (volatility * 50))) * short_vol_safety
 
         # (4) Time & Liquidity: 시간 및 탈출 가능성 가중치
         try:
@@ -375,23 +379,3 @@ class HoneypotService:
             
             print(f"✅ 최종 {len(found_sorted)}개의 보상 시장을 탐지했습니다.")
             return found_sorted
-
-    async def _process_single_market(self, session, market, semaphore):
-        async with semaphore:
-            try:
-                c_id = market.get("conditionId")
-                t_ids = json.loads(market.get("clobTokenIds", "[]"))
-                if not c_id or not t_ids: return None
-
-                r_res = await session.get(f"{self.CLOB_API}/rewards/markets/{c_id}")
-                b_res = await session.get(f"{self.CLOB_API}/book?token_id={t_ids[0]}")
-                h_res = await session.get(f"{self.CLOB_API}/prices-history?token_id={t_ids[0]}&interval=1h")
-                
-                if r_res.status == 200 and b_res.status == 200 and h_res.status == 200:
-                    reward_data = (await r_res.json()).get("data", [])
-                    if not reward_data: return None
-                    vol = self._calculate_volatility(await h_res.json())
-                    return self._calculate_ts_score(market, reward_data[0], await b_res.json(), vol)
-            except: pass
-
-            return None            
