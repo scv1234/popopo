@@ -124,20 +124,25 @@ class MarketMakerBot:
         await self.auto_redeem.close()
 
     async def execute_manual_mint(self, amount: float) -> bool:
-        """프론트엔드에서 설정한 금액만큼 USDC를 쪼개서(Split) 무위험 재고를 확보합니다."""
+        """USDC를 분할하여 무위험 재고를 확보합니다."""
         try:
-            # 1. 지갑의 실제 USDC 잔고 확인
-            balance = await self.order_executor.get_usdc_balance()
-            if balance < amount:
-                logger.error("insufficient_usdc_balance", available=balance, requested=amount)
+            # 1. 현재 마켓의 condition_id 확보 필요 (Honeypot 서비스나 API에서 가져옴)
+            # 임시로 current_market_id 등을 사용하여 조회하는 로직이 필요합니다.
+            condition_id = getattr(self, 'current_condition_id', None) 
+        
+            if not condition_id:
+                logger.error("condition_id_missing_cannot_mint")
                 return False
 
-            # 2. 거래소 컨트랙트를 통해 Split 실행
-            success = await self.order_executor.split_assets(amount)
+            balance = await self.order_executor.get_usdc_balance()
+            if balance < amount:
+                return False
+
+            # 2. condition_id를 인자로 전달하여 호출
+            success = await self.order_executor.split_assets(amount, condition_id)
+        
             if success:
-                # 3. 봇의 인벤토리 메모리에 반영 (Yes +100, No +100 식)
                 self.inventory_manager.record_minting(amount)
-                logger.info("manual_minting_completed", amount=amount)
                 return True
         except Exception as e:
             logger.error("manual_minting_failed", error=str(e))
@@ -705,6 +710,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
 
         pass
+
 
 
 
