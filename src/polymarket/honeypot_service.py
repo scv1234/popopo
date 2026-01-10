@@ -152,6 +152,9 @@ class HoneypotService:
 
                 volatility = self._calculate_volatility(history_data)
                 volatility_1h = self._calculate_short_volatility(history_data)
+
+                if not condition_id:
+                    logger.warning(f"Market {market.get('id')} has no conditionId")
                 
                 return self._calculate_ts_score(
                     market, 
@@ -314,6 +317,8 @@ class HoneypotService:
 
         return {
             "market_id": market.get("conditionId"),
+            "condition_id": market.get("conditionId"), # [추가] 자산 분할용 condition_id
+            "title": market.get("question"),
             "title": market.get("question"),
             "score": round(final_score, 4),
             "mid_yes": round(mid_yes, 3),
@@ -381,4 +386,5 @@ class HoneypotService:
             
             print(f"✅ 최종 {len(found_sorted)}개의 보상 시장을 탐지했습니다.")
             return found_sorted
+
 
