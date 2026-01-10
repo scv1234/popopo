@@ -213,6 +213,15 @@ class MarketMakerBot:
         else:
             await _critical_section()
 
+    def _sort_book(self, orders: list, reverse: bool = False):
+        """리스트 형태([p, s])와 딕셔너리 형태({'price': p}) 모두 대응 가능한 정렬 함수"""
+        if not orders: return []
+        return sorted(
+            orders,
+            key=lambda x: float(x[0] if isinstance(x, list) else x.get('price', 0)),
+            reverse=reverse
+        )
+
     async def update_orderbook(self):
         """REST API를 통한 강제 업데이트 시에도 구조 유지"""
         session = await self.honeypot_service.get_session()
@@ -699,6 +708,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
 
         pass
+
 
 
 
