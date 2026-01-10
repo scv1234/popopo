@@ -53,7 +53,7 @@ class MarketMakerBot:
         self.auto_redeem = AutoRedeem(settings)
         
         # 로컬 상태 변수
-        self.orderbooks: dict[str, dict[str, Any]] = {}
+        self.orderbooks: dict[str, dict[str, Any]] = {} # 복수형으로 통일
         self.open_orders: dict[str, dict[str, Any]] = {}
         self.last_quote_time = 0.0
         self.trade_timestamps = []
@@ -186,9 +186,10 @@ class MarketMakerBot:
             self.spread_cents = market_data.get('spread_cents', 3)
         
             # 상태 초기화
-            self.current_orderbook = {}
+            self.orderbooks = {}
             self.last_quote_time = 0.0
             self.risk_manager.is_halted = False 
+            self.current_tick_size = 0.01
 
             # 3. 새로운 마켓 구독 및 데이터 동기화
             if self.ws_client.running:
@@ -239,7 +240,7 @@ class MarketMakerBot:
     # 3. Event Handlers (웹소켓 데이터 수신)
     # =========================================================================
 
-    def _handle_orderbook_update(self, data: dict[str, Any]):
+    async def _handle_orderbook_update(self, data: dict[str, Any]):
         """웹소켓 오더북 업데이트 핸들러"""
         asset_id = data.get("asset_id") or data.get("token_id")
     
@@ -254,7 +255,7 @@ class MarketMakerBot:
             }
             asyncio.create_task(self.check_and_defend_orders())
 
-    def _handle_trade_update(self, data: dict[str, Any]):
+    async def _handle_trade_update(self, data: dict[str, Any]):
         """내 주문 체결 정보 수신"""
         order_id = data.get("order_id")
         actual_price = float(data.get("price", 0))
@@ -596,11 +597,7 @@ class MarketMakerBot:
                 yes_best_bid=y_bb, yes_best_ask=y_ba,
                 no_best_bid=n_bb, no_best_ask=n_ba,
                 yes_token_id=yes_id, no_token_id=no_id,
-                spread_cents=self.spread_cents,
-                min_size_shares=self.min_size,
-                tick_size=self.current_tick_size,
-                yes_vol_1h=vol_yes, no_vol_1h=vol_no,
-                user_input_shares=amount_usd
+                tick_size=self.current_tick_size
             )
 
             # 5. 주문 전송 (병렬 처리로 실행 속도 극대화)
@@ -708,6 +705,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
 
         pass
+
 
 
 
