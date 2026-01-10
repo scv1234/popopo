@@ -31,8 +31,8 @@ class RiskManager:
         if not bids or not asks: return True, "OK"
 
         # 최상단 호가 물량 합산
-        bid_vol = sum(float(b['size']) for b in bids[:3])
-        ask_vol = sum(float(a['size']) for a in asks[:3])
+        bid_vol = sum(float(b[1]) for b in bids[:3])
+        ask_vol = sum(float(a[1]) for a in asks[:3])
         
         if (bid_vol + ask_vol) == 0: return True, "OK"
         
@@ -95,4 +95,5 @@ class RiskManager:
         self.is_leg_risk_active = False
         self.min_recovery_price = 0.0
         logger.info("🔄 RISK_MANAGER_RESET_SUCCESS")
+
 
