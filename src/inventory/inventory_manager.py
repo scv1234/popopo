@@ -58,6 +58,22 @@ class InventoryManager:
             skew=self.inventory.get_skew(),
         )
 
+    def record_minting(self, amount_shares: float):
+        """
+        민팅(Split) 완료 후 Yes와 No의 수량을 동시에 업데이트합니다.
+        이때 net_exposure_shares는 0(중립)이 유지되어야 합니다.
+        """
+        self.inventory.yes_position += amount_shares
+        self.inventory.no_position += amount_shares
+        
+        # 1:1 상태이므로 노출도는 변하지 않음 (Yes 수량 - No 수량)
+        self.inventory.net_exposure_shares = self.inventory.yes_position - self.inventory.no_position
+        
+        logger.info("Inventory Synced after Minting", 
+                    yes=self.inventory.yes_position, 
+                    no=self.inventory.no_position,
+                    exposure=self.inventory.net_exposure_shares)
+
     def can_quote_yes(self, size_shares: float) -> bool:
         """새로운 YES 주문을 넣었을 때 수량 한도를 넘지 않는지 확인합니다."""
         potential_exposure = self.inventory.net_exposure_shares + size_shares
@@ -83,4 +99,5 @@ class InventoryManager:
         return base_size_shares
 
     def should_rebalance(self, skew_limit: float = 0.3) -> bool:
+
         return not self.inventory.is_balanced(skew_limit)
