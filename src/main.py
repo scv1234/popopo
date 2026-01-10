@@ -124,25 +124,24 @@ class MarketMakerBot:
         await self.auto_redeem.close()
 
     async def execute_manual_mint(self, amount: float) -> bool:
-        """USDC를 분할하여 무위험 재고를 확보합니다."""
+        """저장된 condition_id를 사용하여 자산을 분할(Split)합니다."""
         try:
-            # 1. 현재 마켓의 condition_id 확보 필요 (Honeypot 서비스나 API에서 가져옴)
-            # 임시로 current_market_id 등을 사용하여 조회하는 로직이 필요합니다.
-            condition_id = getattr(self, 'current_condition_id', None) 
-        
-            if not condition_id:
-                logger.error("condition_id_missing_cannot_mint")
+            if not self.current_condition_id:
+                logger.error("minting_failed_no_condition_id")
                 return False
 
+            # 1. 지갑의 실제 USDC 잔고 확인
             balance = await self.order_executor.get_usdc_balance()
             if balance < amount:
+                logger.error("insufficient_usdc_balance", available=balance, requested=amount)
                 return False
 
-            # 2. condition_id를 인자로 전달하여 호출
-            success = await self.order_executor.split_assets(amount, condition_id)
-        
+            # 2. 거래소 컨트랙트를 통해 Split 실행 (condition_id 전달)
+            success = await self.order_executor.split_assets(amount, self.current_condition_id) # [수정]
             if success:
+                # 3. 봇의 인벤토리 메모리에 반영
                 self.inventory_manager.record_minting(amount)
+                logger.info("manual_minting_completed", amount=amount, condition=self.current_condition_id)
                 return True
         except Exception as e:
             logger.error("manual_minting_failed", error=str(e))
@@ -185,10 +184,14 @@ class MarketMakerBot:
 
             # 2. 로컬 상태 변수 업데이트
             self.current_market_id = market_data['market_id']
+            self.current_condition_id = market_data.get('condition_id', "") # [추가]
             self.yes_token_id = market_data['yes_token_id']
             self.no_token_id = market_data['no_token_id']
             self.min_size = market_data['min_size']
-            self.spread_cents = market_data.get('spread_cents', 3)
+            
+            logger.info("market_target_updated", 
+                        market_id=self.current_market_id, 
+                        condition_id=self.current_condition_id)
         
             # 상태 초기화
             self.orderbooks = {}
@@ -710,6 +713,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
 
         pass
+
 
 
 
