@@ -51,6 +51,24 @@ class OrderExecutor:
             logger.error("❌ CLOB Auth Failed", error=str(e))
             raise
 
+    async def split_assets(self, amount_usd: float) -> bool:
+        """
+        보유한 USDC를 1:1 비율로 Yes와 No 토큰으로 분할(Split)합니다.
+        무위험 파밍의 첫 단추인 '델타 뉴트럴' 상태를 만듭니다.
+        """
+        try:
+            # USDC 소수점 6자리 적용
+            amount_raw = int(amount_usd * 1e6)
+            
+            # SDK의 split_assets 호출 (CTF 컨트랙트와 상호작용)
+            # 성공 시 결과가 반환됩니다.
+            result = self.client.split_assets(amount_raw)
+            logger.info("✅ Asset Split Successful", amount=amount_usd, result=result)
+            return True
+        except Exception as e:
+            logger.error("❌ Asset Split Failed", error=str(e))
+            return False
+
     async def place_order(self, order_params: Dict[str, Any]) -> Optional[Dict]:
         """주문 생성 (main.py의 'token_id'와 'id' 기대치 충족)"""
         try:
@@ -130,4 +148,5 @@ class OrderExecutor:
 
     async def close(self):
         """세션 종료 (SDK는 동기 방식이므로 pass 처리)"""
+
         pass
