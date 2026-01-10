@@ -453,7 +453,7 @@ class MarketMakerBot:
         # Risk Manager 검증
         # [수정] 해당 토큰의 오더북을 참조하여 검증
         token_book = self.orderbooks.get(quote.token_id, {})
-        valid, reason = self.risk_manager.validate_order(quote.side, quote.size, token_book)
+        valid, reason = self.risk_manager.validate_order(quote.side, quote.price, token_book)
         
         if not valid:
             logger.debug("quote_skipped", reason=reason, outcome=outcome)
@@ -696,5 +696,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
 
         pass
+
 
 
