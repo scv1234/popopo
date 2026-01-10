@@ -250,11 +250,14 @@ class MarketMakerBot:
         token_id = data.get("token_id")
         side = data.get("side")
 
-        # [수정] SELL(매도) 체결 시, QuoteEngine에 판매가 기록 (원금 사수용)
         if side == "SELL":
             token_type = "YES" if token_id == self.yes_token_id else "NO"
-            self.quote_engine.update_last_sold_price(token_type, actual_price)
-            logger.info(f"recorded_sold_price", type=token_type, price=actual_price)
+            # 1. RiskManager에 판매 가격 기록 및 회수 타겟 설정
+            self.risk_manager.set_recovery_target(price)
+            # 2. QuoteEngine에도 최신 판매가 전달
+            self.quote_engine.update_last_sold_price(token_type, price)
+        
+            logger.info("TRADE_CONSUMED_SETTING_RECOVERY", type=token_type, price=price)
         
         # 1. 인벤토리 즉시 업데이트
         yes_delta = size if token_id == self.yes_token_id and side == "BUY" else (-size if token_id == self.yes_token_id else 0)
@@ -419,23 +422,6 @@ class MarketMakerBot:
         if inv.no_shares > 0:
             await self.order_executor.place_market_order(
                 self.current_market_id, "SELL", inv.no_shares, self.no_token_id)
-
-    async def execute_auto_hedge(self, amount: float, aggressive: bool = False):
-        try:
-            target_token = self.yes_token_id if amount > 0 else self.no_token_id
-            target_price = 0.99
-            
-            if not aggressive:
-                session = await self.honeypot_service.get_session()
-                book = await self.honeypot_service.get_orderbook(session, target_token)
-                target_price = float(book.get("best_ask", 0.99))
-
-            await self.order_executor.place_order({
-                "market": self.current_market_id, "side": "BUY", "size": str(abs(amount)),
-                "price": str(target_price), "token_id": target_token
-            })
-        except Exception as e:
-            logger.error("hedge_failed", error=str(e))
 
     # =========================================================================
     # 5. Execution Loop (주문 생성 및 관리)
@@ -739,3 +725,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
 
         pass
+
