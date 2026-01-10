@@ -202,15 +202,17 @@ class HoneypotService:
         if not bids or not asks:
             return 0, 0.5
 
-        # 매수(Bids): 비싼 가격 -> 싼 가격 (내림차순)
-        # 매수(Bids): 비싼 가격 -> 싼 가격 (내림차순)
-        bids.sort(key=lambda x: float(x['price']), reverse=True)
-        # 매도(Asks): 싼 가격 -> 비싼 가격 (오름차순)
-        asks.sort(key=lambda x: float(x['price']))
+        bids.sort(
+            key=lambda x: float(x[0] if isinstance(x, list) else x.get('price', 0)), 
+            reverse=True
+        )
+        asks.sort(
+            key=lambda x: float(x[0] if isinstance(x, list) else x.get('price', 0))
+        )
 
-        # 1. 미드 가격 계산 (정렬 후에는 0번째 인덱스가 Best Price)
-        best_bid = float(bids[0]['price'])
-        best_ask = float(asks[0]['price'])
+        # 이제 0번 인덱스가 확실한 최상단 호가입니다.
+        best_bid = float(bids[0][0] if isinstance(bids[0], list) else bids[0]['price'])
+        best_ask = float(asks[0][0] if isinstance(asks[0], list) else asks[0]['price'])
     
         mid_price = (best_bid + best_ask) / 2
 
@@ -379,3 +381,4 @@ class HoneypotService:
             
             print(f"✅ 최종 {len(found_sorted)}개의 보상 시장을 탐지했습니다.")
             return found_sorted
+
