@@ -26,6 +26,21 @@
         }
         .active-orders-title::before { content: ''; display: inline-block; width: 4px; height: 14px; background: var(--gold); border-radius: 2px; }
 
+        /* 실시간 상태바 스타일 */
+        .live-status-bar {
+            display: flex; align-items: center; gap: 15px; padding: 8px 15px; 
+            background: rgba(0,0,0,0.3); border-radius: 6px; margin-bottom: 10px; border: 1px solid var(--border);
+        }
+        .pulse-green { 
+            width: 8px; height: 8px; background-color: #2ecc71; border-radius: 50%; 
+            box-shadow: 0 0 0 0 rgba(46, 204, 113, 0.7); animation: pulse 2s infinite; 
+        }
+        @keyframes pulse { 
+            0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(46, 204, 113, 0.7); } 
+            70% { transform: scale(1); box-shadow: 0 0 0 6px rgba(46, 204, 113, 0); } 
+            100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(46, 204, 113, 0); } 
+        }
+
         .content-scroll { overflow-y: auto; flex-grow: 1; min-height: 0; }
         table { width: 100%; border-collapse: collapse; table-layout: fixed; } 
         th { text-align: center; color: var(--text-muted); padding: 8px 2px; font-size: 10px; border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--panel); z-index: 10; }
@@ -41,18 +56,6 @@
             100% { background: rgba(35, 134, 54, 0.1); box-shadow: inset 0 0 5px var(--accent); }
         }
         .highlight-opt { animation: sparkle-glow 2s infinite ease-in-out; border: 1px solid var(--gold) !important; z-index: 5; }
-
-        .order-card { background: rgba(0,0,0,0.2); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; overflow: hidden; }
-        .order-card-header { background: rgba(88, 166, 255, 0.05); padding: 6px 10px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
-        .order-card-header span { color: var(--gold); font-weight: bold; font-size: 11px; }
-        .order-table { width: 100%; border-collapse: collapse; }
-        .order-table th { font-size: 9px; color: var(--text-muted); background: transparent; padding: 4px; border-bottom: 1px solid #21262d; }
-        .order-table td { padding: 5px 4px; font-family: 'Consolas', monospace; font-size: 11px; border-bottom: 1px solid rgba(255,255,255,0.03); }
-        .badge { padding: 1px 4px; border-radius: 3px; font-size: 9px; font-weight: bold; }
-        .badge-yes { background: rgba(88, 166, 255, 0.15); color: var(--blue); border: 1px solid rgba(88, 166, 255, 0.3); }
-        .badge-no { background: rgba(218, 54, 51, 0.15); color: var(--red); border: 1px solid rgba(218, 54, 51, 0.3); }
-        .btn-cancel-mini { background: transparent; border: 1px solid var(--gray); color: var(--text-muted); border-radius: 4px; padding: 1px 5px; cursor: pointer; transition: 0.2s; font-size: 10px; }
-        .btn-cancel-mini:hover { background: var(--red); color: white; border-color: var(--red); }
 
         .stat-box { background: #0d1117; padding: 12px; border-radius: 4px; text-align: center; margin-bottom: 6px; }
         input, button { border-radius: 4px; padding: 8px; font-size: 12px; box-sizing: border-box; }
@@ -78,11 +81,16 @@
 
 <div id="toast-container"></div>
 
+<div class="live-status-bar">
+    <div class="pulse-green" id="ws-indicator"></div>
+    <span style="font-size: 11px; font-weight: bold; color: var(--text);">WS LIVE</span>
+    <span id="last-update-time" style="font-size: 11px; color: var(--text-muted); margin-left: auto;">Last Update: --:--:--</span>
+</div>
+
 <div class="main-layout">
     <div class="column">
         <div class="panel" style="flex-shrink: 0;">
             <div class="panel-header"><h2>🤖 System</h2></div>
-            <div id="bot-status" class="stat-box" style="padding: 5px; font-size: 11px;">Connecting...</div>
             <div class="stat-box">
                 <small style="color: var(--text-muted); font-size: 10px; display: block;">USDC (RPC Wallet)</small>
                 <div id="wallet-usdc" style="font-weight: bold; color: var(--gold); font-size: 22px;">$0</div>
@@ -149,26 +157,18 @@
         setTimeout(() => { toast.style.opacity = '0'; toast.style.transform = 'translateX(100%)'; setTimeout(() => toast.remove(), 500); }, 3000);
     }
 
-    // Mid Price 계산 헬퍼 (데이터 필드 보강)
     function getMidPrice(m) {
-        // 1. 백엔드에서 보내주는 실시간 YES 가격을 최우선으로 사용
         if (m.mid_yes !== undefined && m.mid_yes !== null) return m.mid_yes; 
-    
-        // 2. 만약 mid_yes가 없다면 기존 필드 확인
         if (m.mid_price) return m.mid_price;
-    
-        // 3. 마지막 수단으로 기본값 반환
         return 0.500;
     }
 
     function selectMarket(marketId, slug) {
         const inputField = document.getElementById('order-market-id');
-        if (inputField) {
-            inputField.dataset.realId = marketId;
-            inputField.value = slug || marketId;
-            inputField.style.backgroundColor = 'rgba(88, 166, 255, 0.2)';
-            setTimeout(() => { inputField.style.backgroundColor = '#0d1117'; }, 300);
-        }
+        inputField.dataset.realId = marketId;
+        inputField.value = slug || marketId;
+        inputField.style.backgroundColor = 'rgba(88, 166, 255, 0.2)';
+        setTimeout(() => { inputField.style.backgroundColor = '#0d1117'; }, 300);
     }
 
     function runOptimizer() {
@@ -227,26 +227,17 @@
         const targets = Object.entries(lastOptimizerAllocations).filter(([_, amt]) => amt > 0);
         if (targets.length === 0) return showToast("Analyze first!", "error");
         if (!confirm(`${targets.length}개 시장에 일괄 주문을 넣으시겠습니까?`)) return;
-        showToast(`Placing batch orders for ${targets.length} markets...`, 'info');
+        showToast(`Placing batch orders...`, 'info');
         for (const [id, amt] of targets) {
             const m = marketData.find(md => md.market_id === id);
             try {
-                // [중요] 각 주문 사이에 0.3초(300ms) 간격을 두어 속도 제한을 회피합니다.
                 await new Promise(resolve => setTimeout(resolve, 300)); 
-            
                 await fetch(`${API_URL}/place-semi-auto-order`, { 
                     method: 'POST', 
                     headers: {'Content-Type': 'application/json'}, 
-                    body: JSON.stringify({ 
-                        market_id: id, 
-                        amount: amt, 
-                        yes_token_id: m.yes_token_id, 
-                        no_token_id: m.no_token_id 
-                    }) 
+                    body: JSON.stringify({ market_id: id, amount: amt, yes_token_id: m.yes_token_id, no_token_id: m.no_token_id }) 
                 });
-            } catch (e) {
-                console.error(`Order failed for ${id}`, e);
-            }
+            } catch (e) { console.error(`Order failed for ${id}`, e); }
         }
         showToast("Optimizer batch orders completed!");
         updateOrders();
@@ -264,7 +255,7 @@
             marketData = await res.json();
             const simAmt = parseFloat(document.getElementById('sim-amount').value) || 1000;
             document.getElementById('market-table-body').innerHTML = marketData.map(m => {
-                const midP = getMidPrice(m); // 보강된 계산 로직 사용
+                const midP = getMidPrice(m);
                 return `
                 <tr data-market-id="${m.market_id}" onclick="selectMarket('${m.market_id}', '${m.slug}')" style="cursor:pointer;">
                     <td style="color:var(--gold); font-weight:bold;">${m.score.toFixed(1)}</td>
@@ -282,64 +273,47 @@
                     <td>$${m.reward}</td>
                 </tr>`;
             }).join('');
-        } catch(e){}
+            document.getElementById('last-update-time').innerText = "Last Update: " + new Date().toLocaleTimeString();
+            document.getElementById('ws-indicator').style.backgroundColor = '#2ecc71';
+        } catch(e){ document.getElementById('ws-indicator').style.backgroundColor = '#da3633'; }
     }
-
-    async function updateStatus() { try { const res = await fetch(`${API_URL}/status`); const d = await res.json(); const s = document.getElementById('bot-status'); s.textContent = d.is_halted ? "🚨 HALTED" : "🟢 ONLINE"; s.style.background = d.is_halted ? "var(--red)" : "var(--accent)"; } catch(e){} }
 
     async function updateOrders() {
-    try {
-        const res = await fetch(`${API_URL}/open-orders`);
-        const data = await res.json(); // { "market_id": { "YES": [...], "NO": [...] }, ... }
-        const div = document.getElementById('open-orders');
+        try {
+            const res = await fetch(`${API_URL}/open-orders`);
+            const data = await res.json();
+            const div = document.getElementById('open-orders');
+            if (Object.keys(data).length === 0) { div.innerHTML = '<div style="text-align:center; padding:20px; color:var(--text-muted);">활성 주문이 없습니다.</div>'; return; }
 
-        // 주문 데이터가 아예 없는 경우 처리
-        if (Object.keys(data).length === 0) {
-            div.innerHTML = '<div style="text-align:center; padding:20px; color:var(--text-muted);">활성 주문이 없습니다.</div>';
-            return;
-        }
-
-        // 시장(market_id)별로 순회하며 렌더링
-        div.innerHTML = Object.entries(data).map(([mid, outcomes]) => {
-            // marketData(꿀통 리스트)에서 시장 이름 찾기
-            const marketInfo = marketData.find(m => m.market_id === mid);
-            const displayName = marketInfo ? marketInfo.title : `Market: ${mid.substring(0, 8)}...`;
-            const slug = marketInfo ? marketInfo.slug : "";
-
-            return `
-            <div style="border:1px solid var(--border); border-radius:6px; padding:10px; margin-bottom:12px; background:rgba(255,255,255,0.02);">
-                <div style="font-size:11px; color:var(--gold); font-weight:bold; margin-bottom:8px; border-bottom:1px solid var(--border); padding-bottom:5px; display:flex; justify-content:space-between;">
-                    <span style="cursor:pointer;" onclick="selectMarket('${mid}', '${slug}')">📍 ${displayName}</span>
-                </div>
-                
-                ${['YES', 'NO'].map(side => {
-                    const orders = outcomes[side] || [];
-                    if (orders.length === 0) return '';
-                    
-                    return `
-                    <div style="margin-bottom:6px;">
-                        <div style="font-size:10px; color:var(--text-muted); margin-bottom:3px;">${side} Orders</div>
-                        ${orders.map(o => `
-                            <div style="display:flex; justify-content:space-between; align-items:center; background:rgba(0,0,0,0.2); padding:5px 8px; border-radius:4px; margin-top:3px; font-size:11px; border-left: 2px solid ${o.side === 'BUY' ? '#2ecc71' : '#e74c3c'};">
-                                <div style="display:flex; gap:12px;">
-                                    <span style="color:${o.side === 'BUY' ? '#2ecc71' : '#e74c3c'}; font-weight:bold; width:30px;">${o.side}</span>
-                                    <span style="font-family:monospace;">$${o.price.toFixed(3)}</span>
-                                    <span style="color:var(--blue); font-weight:bold;">${o.size.toLocaleString()} Shares</span>
-                                </div>
-                                <button onclick="cancelById('${o.order_id}')" 
-                                        style="background:none; border:none; color:var(--red); cursor:pointer; font-weight:bold; padding:0 5px; font-size:14px;">✕</button>
-                            </div>
-                        `).join('')}
+            div.innerHTML = Object.entries(data).map(([mid, outcomes]) => {
+                const mInfo = marketData.find(m => m.market_id === mid);
+                const displayName = mInfo ? mInfo.title : `Market: ${mid.substring(0, 8)}...`;
+                return `
+                <div style="border:1px solid var(--border); border-radius:6px; padding:10px; margin-bottom:12px; background:rgba(255,255,255,0.02);">
+                    <div style="font-size:11px; color:var(--gold); font-weight:bold; margin-bottom:8px; border-bottom:1px solid var(--border); padding-bottom:5px;">
+                        <span style="cursor:pointer;" onclick="selectMarket('${mid}', '${mInfo?.slug}')">📍 ${displayName}</span>
                     </div>
-                    `;
-                }).join('')}
-            </div>
-            `;
-        }).join('');
-    } catch (e) {
-        console.error("Orders update failed:", e);
+                    ${['YES', 'NO'].map(side => {
+                        const orders = outcomes[side] || [];
+                        if (orders.length === 0) return '';
+                        return `
+                        <div style="margin-bottom:6px;">
+                            <div style="font-size:10px; color:var(--text-muted); margin-bottom:3px;">${side} Orders</div>
+                            ${orders.map(o => `
+                                <div style="display:flex; justify-content:space-between; align-items:center; background:rgba(0,0,0,0.2); padding:5px 8px; border-radius:4px; margin-top:3px; font-size:11px; border-left: 2px solid ${o.side === 'BUY' ? '#2ecc71' : '#e74c3c'};">
+                                    <div style="display:flex; gap:12px;">
+                                        <span style="color:${o.side === 'BUY' ? '#2ecc71' : '#e74c3c'}; font-weight:bold; width:30px;">${o.side}</span>
+                                        <span style="font-family:monospace;">$${o.price.toFixed(3)}</span>
+                                        <span style="color:var(--blue); font-weight:bold;">${o.size.toLocaleString()} Shares</span>
+                                    </div>
+                                    <button onclick="cancelById('${o.order_id}')" class="btn-cancel-mini">✕</button>
+                                </div>`).join('')}
+                        </div>`;
+                    }).join('')}
+                </div>`;
+            }).join('');
+        } catch (e) { console.error("Orders update failed:", e); }
     }
-}
 
     async function updateLogs() { 
         try { 
@@ -350,54 +324,40 @@
         } catch(e){} 
     }
 
-    async function cancelById(id) { await fetch(`${API_URL}/cancel-order/${id}`, {method:'POST'}); showToast(`Order cancelled: ${id}`, 'info'); updateOrders(); }
+    async function cancelById(id) { await fetch(`${API_URL}/cancel-order/${id}`, {method:'POST'}); showToast(`Order cancelled`, 'info'); updateOrders(); }
     async function batchCancelManual() { if(confirm("Cancel all orders?")) { await fetch(`${API_URL}/batch-cancel-manual`, {method:'POST'}); showToast("All orders cancelled", 'error'); updateOrders(); } }
     
     async function placeOrder() { 
         const input = document.getElementById('order-market-id'); 
         const id = input.dataset.realId; 
         const amt = parseFloat(document.getElementById('order-amount').value); 
-        
         if(!id) return showToast("Select a market first!", "error"); 
-        
         const m = marketData.find(md => md.market_id === id); 
         if(!m) return showToast("Market data not found", "error");
 
-        // [추가] 주문 실행 전 확인 팝업창
-        const confirmMsg = `🚀 주문을 실행하시겠습니까?\n\n` +
-                           `📍 시장: ${m.title}\n` +
-                           `💰 수량: ${amt} Shares\n` +
-                           `📈 예상가: ${m.mid_yes.toFixed(3)}`;
-        
-        if(!confirm(confirmMsg)) return; // 취소를 누르면 중단
+        if(!confirm(`🚀 주문을 실행하시겠습니까?\n📍 시장: ${m.title}\n💰 수량: ${amt} Shares`)) return;
 
         try {
             showToast("Placing manual order...", "info");
             const res = await fetch(`${API_URL}/place-semi-auto-order`, { 
-                method: 'POST', 
-                headers: {'Content-Type': 'application/json'}, 
-                body: JSON.stringify({ 
-                    market_id: id, 
-                    amount: amt, 
-                    yes_token_id: m.yes_token_id, 
-                    no_token_id: m.no_token_id 
-                }) 
+                method: 'POST', headers: {'Content-Type': 'application/json'}, 
+                body: JSON.stringify({ market_id: id, amount: amt, yes_token_id: m.yes_token_id, no_token_id: m.no_token_id }) 
             });
-            
-            if(res.ok) {
-                showToast(`주문 성공: $${amt} on ${m.slug}`, "success");
-            } else {
-                const errData = await res.json();
-                showToast(`주문 실패: ${errData.detail || "Error"}`, "error");
-            }
-        } catch (e) { 
-            showToast("Connection error", "error"); 
-        }
+            if(res.ok) { showToast(`주문 성공!`, "success"); } else { showToast(`주문 실패`, "error"); }
+        } catch (e) { showToast("Connection error", "error"); }
         updateOrders(); 
     }
 
-    setInterval(updateStatus, 1500); setInterval(updateWallet, 3000); setInterval(updateMarkets, 5000); setInterval(updateOrders, 2000); setInterval(updateLogs, 3000);
-    updateMarkets(); updateStatus(); updateWallet(); updateOrders(); updateLogs();
+    // 통합 갱신 엔진 (주기 최적화)
+    setInterval(updateWallet, 5000); 
+    setInterval(updateMarkets, 1500); 
+    setInterval(updateOrders, 2000); 
+    setInterval(updateLogs, 3000);
+
+    // 초기 로드
+    window.addEventListener('load', () => {
+        updateMarkets(); updateWallet(); updateOrders(); updateLogs();
+    });
 </script>
 </body>
 </html>

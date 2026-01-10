@@ -43,7 +43,7 @@ class PolymarketWebSocketClient:
             elif hasattr(self.websocket, 'open'):
                 is_connected = self.websocket.open
             else:
-                # [오류 수정] .contains('OPEN') -> "OPEN" in ...
+                # 최신 버전의 경우 state 속성 검사 (contains 대신 'in' 사용)
                 state_str = str(getattr(self.websocket, 'state', ''))
                 is_connected = "OPEN" in state_str
 

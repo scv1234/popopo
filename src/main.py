@@ -515,45 +515,48 @@ class MarketMakerBot:
 
     async def execute_manual_safety_order(self, market_id: str, amount_usd: float, yes_id: str = None, no_id: str = None) -> bool:
         """
-        일괄 주문 및 수동 주문 시 데이터 누락을 방지하는 강화된 실행 로직.
-        [메모리(캐시) -> API 실시간 조회 -> DB 백업] 순서로 데이터를 확보합니다.
+        [전체 코드] 시장별 수동/일괄 주문 실행 로직.
+        속도 최적화를 위해 병렬 API 호출을 사용하며, 데이터 부재 시 DB 캐시를 활용합니다.
         """
         try:
-            # 1. 봇의 실시간 메모리(WebSocket) 데이터 우선 확인
-            yes_book = self.orderbooks.get(yes_id, {}) if yes_id else {}
-            no_book = self.orderbooks.get(no_id, {}) if no_id else {}
+            session = await self.honeypot_service.get_session()
 
-            # 2. 메모리에 데이터가 없는 경우 API 실시간 조회 시도
-            if not yes_book or not no_book:
-                session = await self.honeypot_service.get_session()
-                
-                # Token ID가 누락된 경우 CLOB API에서 복구
-                if not yes_id or not no_id:
+            # 1. 토큰 ID 복구 (ID가 없을 경우 CLOB API에서 즉시 조회)
+            if not yes_id or not no_id:
+                try:
                     clob_url = f"{self.honeypot_service.CLOB_API}/markets/{market_id}"
-                    async with session.get(clob_url) as res:
+                    async with session.get(clob_url, timeout=5) as res:
                         if res.status == 200:
                             data = await res.json()
                             tokens = data.get("tokens", [])
                             if len(tokens) >= 2:
                                 yes_id = next((t['token_id'] for t in tokens if t.get('outcome') == 'Yes'), tokens[0]['token_id'])
                                 no_id = next((t['token_id'] for t in tokens if t.get('outcome') == 'No'), tokens[1]['token_id'])
+                except Exception as e:
+                    logger.error("token_id_recovery_failed", error=str(e))
 
-                # 병렬 API 호출 (타임아웃 대비 return_exceptions=True 적용)
+            # 2. 오더북 데이터 확보 (메모리 -> 병렬 API 호출 -> DB 백업 순)
+            yes_book = self.orderbooks.get(yes_id, {}) if yes_id else {}
+            no_book = self.orderbooks.get(no_id, {}) if no_id else {}
+
+            # 메모리에 데이터가 없으면 API를 통해 실시간 조회 (병렬 처리로 속도 향상)
+            if not yes_book or not no_book:
                 tasks = [
                     self.honeypot_service.get_orderbook(session, yes_id),
                     self.honeypot_service.get_orderbook(session, no_id)
                 ]
+                # return_exceptions=True를 사용하여 하나가 실패해도 다른 하나는 진행
                 responses = await asyncio.gather(*tasks, return_exceptions=True)
                 
-                # 결과 반영 (성공한 데이터만 취함)
                 if isinstance(responses[0], dict) and responses[0]: yes_book = responses[0]
                 if isinstance(responses[1], dict) and responses[1]: no_book = responses[1]
 
-            # 3. [핵심] API 실패 시 DB 캐시(스캐너가 저장한 꿀통 정보)에서 데이터 복구
+            # API 호출마저 실패하거나 타임아웃된 경우 DB 캐시(스캔 데이터)에서 복구
             if not yes_book or not no_book:
                 logger.info("falling_back_to_db_cache", market=market_id)
-                import sqlite3
                 try:
+                    import sqlite3
+                    import json
                     conn = sqlite3.connect('bot_data.db')
                     cursor = conn.cursor()
                     cursor.execute("SELECT data FROM honeypots WHERE id = ?", (market_id,))
@@ -562,26 +565,26 @@ class MarketMakerBot:
                     
                     if row:
                         db_m = json.loads(row[0])
-                        # DB의 중간가를 기반으로 가상의 오더북 생성하여 주문 중단 방지
                         mid_y = db_m.get('mid_yes', 0.5)
                         mid_n = db_m.get('mid_no', 0.5)
+                        # DB 데이터를 바탕으로 가상의 오더북 생성 (주문 중단 방지)
                         if not yes_book: yes_book = {"bids": [[mid_y - 0.001, 10]], "asks": [[mid_y + 0.001, 10]]}
                         if not no_book: no_book = {"bids": [[mid_n - 0.001, 10]], "asks": [[mid_n + 0.001, 10]]}
                 except Exception as db_err:
                     logger.error("db_fallback_failed", error=str(db_err))
 
-            # 4. 최종 데이터 검증
+            # 최종 데이터 검증
             if not yes_book or not no_book:
-                logger.error("order_aborted_no_data", reason="All sources (Cache, API, DB) failed")
+                logger.error("order_aborted_no_data", reason="All sources failed")
                 return False
 
-            # 5. 최우선 호가 추출 및 변동성 설정
+            # 3. 최우선 호가 및 변동성 추출 헬퍼
             def get_bb_ba(book):
                 bids = book.get("bids", [])
                 asks = book.get("asks", [])
-                # 리스트([price, size])와 사전({'price': p}) 구조 모두 대응
-                bb = float(bids[0][0] if isinstance(bids[0], list) else bids[0].get('price', 0)) if bids else 0.0
-                ba = float(asks[0][0] if isinstance(asks[0], list) else asks[0].get('price', 1)) if asks else 1.0
+                # 데이터 형식이 [[price, size], ...] 이든 [{'price': p, ...}, ...] 이든 대응 가능하게 처리
+                bb = float(bids[0][0] if bids and isinstance(bids[0], list) else (bids[0].get('price', 0) if bids else 0.0))
+                ba = float(asks[0][0] if asks and isinstance(asks[0], list) else (asks[0].get('price', 1) if asks else 1.0))
                 return bb, ba
 
             y_bb, y_ba = get_bb_ba(yes_book)
@@ -589,7 +592,7 @@ class MarketMakerBot:
             vol_yes = float(yes_book.get("volatility_1h", 0.005))
             vol_no = float(no_book.get("volatility_1h", 0.005))
 
-            # 6. 호가 생성 (Quote Engine 호출)
+            # 4. 호가 생성 (Quote Engine 호출)
             yes_quote, no_quote = self.quote_engine.generate_quotes(
                 market_id=market_id,
                 yes_best_bid=y_bb, yes_best_ask=y_ba,
@@ -602,17 +605,33 @@ class MarketMakerBot:
                 user_input_shares=amount_usd
             )
 
-            # 7. 주문 실행
-            success_yes = await self._place_quote(yes_quote, "YES", is_manual=True) if yes_quote else False
-            success_no = await self._place_quote(no_quote, "NO", is_manual=True) if no_quote else False
+            # 5. 주문 전송 (병렬 처리로 실행 속도 극대화)
+            order_tasks = []
+            if yes_quote:
+                order_tasks.append(self._place_quote(yes_quote, "YES", is_manual=True))
+            if no_quote:
+                order_tasks.append(self._place_quote(no_quote, "NO", is_manual=True))
+            
+            if not order_tasks:
+                logger.warning("no_quotes_generated", market=market_id)
+                return False
+
+            results = await asyncio.gather(*order_tasks)
+            
+            # 성공 여부 확인
+            success_yes = results[0] if len(results) > 0 and yes_quote else False
+            success_no = results[1] if len(results) > 1 and no_quote else False
 
             if success_yes or success_no:
                 logger.info("manual_order_success", market=market_id, yes=success_yes, no=success_no)
-                # 실시간 감시를 위해 즉시 구독 추가
+                
+                # [중요] 주문 성공 즉시 해당 토큰들을 웹소켓 실시간 감시 목록에 추가
                 if yes_id: await self.ws_client.subscribe_orderbook(yes_id)
                 if no_id: await self.ws_client.subscribe_orderbook(no_id)
+                
                 return True
             
+            logger.error("manual_order_all_failed", market=market_id)
             return False
 
         except Exception as e:
