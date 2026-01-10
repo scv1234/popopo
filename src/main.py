@@ -250,33 +250,20 @@ class MarketMakerBot:
         token_id = data.get("token_id")
         side = data.get("side")
 
+        # [핵심] 매도(SELL) 체결 시 원금 회수 마지노선 설정
         if side == "SELL":
             token_type = "YES" if token_id == self.yes_token_id else "NO"
-            # 1. RiskManager에 판매 가격 기록 및 회수 타겟 설정
-            self.risk_manager.set_recovery_target(price)
-            # 2. QuoteEngine에도 최신 판매가 전달
-            self.quote_engine.update_last_sold_price(token_type, price)
+            # 변수명 수정: price -> actual_price
+            self.risk_manager.set_recovery_target(actual_price)
+            self.quote_engine.update_last_sold_price(token_type, actual_price)
+            logger.info("TRADE_CONSUMED_SETTING_RECOVERY", type=token_type, price=actual_price)
         
-            logger.info("TRADE_CONSUMED_SETTING_RECOVERY", type=token_type, price=price)
-        
-        # 1. 인벤토리 즉시 업데이트
-        yes_delta = size if token_id == self.yes_token_id and side == "BUY" else (-size if token_id == self.yes_token_id else 0)
-        no_delta = size if token_id == self.no_token_id and side == "BUY" else (-size if token_id == self.no_token_id else 0)
+        # 인벤토리 수량 업데이트
+        yes_delta = -size if token_id == self.yes_token_id and side == "SELL" else 0
+        no_delta = -size if token_id == self.no_token_id and side == "SELL" else 0
         self.inventory_manager.update_inventory(yes_delta, no_delta)
 
-        # 2. 독성 흐름 감지
-        now = time.time()
-        self.trade_timestamps.append(now)
-        self.trade_timestamps = [t for t in self.trade_timestamps if now - t < 10]
-        if len(self.trade_timestamps) >= 5: 
-            asyncio.create_task(self.handle_emergency("TOXIC_FLOW_DETECTED", exit_position=False))
-            return
-
-        # 3. 방어 로직 예약 (복사한 order_info를 직접 전달)
-        if order_id:
-            asyncio.create_task(self._defend_after_trade(actual_price, order_id, order_info))
-
-        # 4. 관리 목록 정리 (모든 예약이 끝난 후 삭제)
+        # 관리 목록 정리 (헤징/디펜드 호출 삭제)
         if order_id:
             self.manual_order_ids.discard(order_id)
             self.open_orders.pop(order_id, None)
@@ -288,12 +275,14 @@ class MarketMakerBot:
     async def check_and_defend_orders(self):
         """
         오더북 변화에 따른 실시간 방어.
-        Lock을 사용하지 않고 빠르게 판단하되, 조치(Action)가 필요할 때만 개입합니다.
+        파밍 전략에 맞춰 '중간값에 가깝다'는 이유로 주문을 취소하지 않고, 
+        '보상 범위를 벗어났거나 본전 사수가 불가능할 때'만 개입합니다.
         """
         if self.risk_manager.is_halted: return
+        
+        # 현재 열려있는 주문들의 토큰 ID 목록 추출
         active_tokens = {order.get("token_id") for order in self.open_orders.values() if order.get("token_id")}
 
-        # 두 토큰 각각에 대해 방어 로직 수행
         for token_id in active_tokens:
             book = self.orderbooks.get(token_id)
             if not book: continue
@@ -302,53 +291,36 @@ class MarketMakerBot:
             asks = book.get("asks", [])
             if not bids or not asks: continue
 
-            best_bid = float(bids[0]['price'])
-            best_ask = float(asks[0]['price'])
-            market_spread = best_ask - best_bid
+            # 폴리마켓 L2 데이터 구조 [price, size] 대응
+            best_bid = float(bids[0][0])
+            best_ask = float(asks[0][0])
             mid_price = (best_bid + best_ask) / 2.0
             
-            spread_usd = self.spread_cents / 100.0
-            limit_spread = spread_usd * 2.5
-
-            if market_spread > limit_spread:
-                logger.warning(f"market_spread_too_wide for {token_id}", current=market_spread)
-                await self._reset_local_market_state()
-                return
+            # 리워드를 받을 수 있는 최대 스프레드 범위 (예: 2~3센트)
+            reward_spread_usd = self.spread_cents / 100.0
 
             for order_id, order in list(self.open_orders.items()):
                 if order.get("token_id") != token_id: continue
                 
-                price_diff = abs(mid_price - float(order.get("price", 0)))
-                is_risky = price_diff < (spread_usd * 0.3)
-                is_invalid = price_diff > spread_usd
-                
-                if is_risky or is_invalid:
-                    logger.info("defending_manual_order", id=order_id, reason="PRICE_RISK")
-                    # 전체 리셋 대신 위험한 해당 주문만 취소하거나, 안전을 위해 전체 취소 실행
+                order_price = float(order.get("price", 0))
+                price_diff = abs(mid_price - order_price)
+
+                # --- 방어 로직 1: 보상 범위 이탈 (is_invalid) ---
+                # 주문이 중간값에서 너무 멀어져 리워드 지급 범위를 벗어났다면 재배치를 위해 취소
+                is_out_of_reward_range = price_diff > reward_spread_usd
+
+                # --- 방어 로직 2: 본전 사수 불가능 (Min Recovery Check) ---
+                # 만약 한쪽이 팔린 상태(Leg Risk)인데, 시장가가 내 본전 회수 가격보다 낮아졌다면 방어
+                is_below_recovery = False
+                if self.risk_manager.is_leg_risk_active:
+                    # 현재 주문 가격이 본전 마지노선보다 낮다면 즉시 취소
+                    if order_price < self.risk_manager.min_recovery_price:
+                        is_below_recovery = True
+
+                if is_out_of_reward_range or is_below_recovery:
+                    reason = "OUT_OF_REWARD_RANGE" if is_out_of_reward_range else "BELOW_RECOVERY_PRICE"
+                    logger.info("defending_order", id=order_id, reason=reason)
                     await self.cancel_single_order(order_id)
-
-    async def _defend_after_trade(self, actual_price: float, order_id: str, order_info: dict = None):
-        """체결 직후 리스크 점검 (Circuit Breaker, Hedging)"""
-        # 1. 인벤토리 상태 점검 (항상 실행)
-        if self.risk_manager.get_inventory_status() == "EMERGENCY":
-            await self.handle_emergency("INVENTORY_CRITICAL_SKEW", exit_position=True)
-            return
-
-        # 2. 가격 이탈 검증 (Circuit Breaker)
-        # [핵심] 이제 self.open_orders가 아니라 전달받은 order_info를 사용합니다.
-        if order_info:
-            expected_price = float(order_info.get("price", 0))
-            side = order_info.get("side", "UNKNOWN")
-
-            if not self.risk_manager.validate_execution_price(expected_price, actual_price, side):
-                logger.error("circuit_breaker_halted", order_id=order_id, expected=expected_price, actual=actual_price)
-                await self._reset_local_market_state()
-                return
-
-        # 3. 델타 뉴트럴 헤징
-        hedge_needed = self.risk_manager.calculate_hedge_need()
-        if abs(hedge_needed) >= 1.0: 
-            await self.execute_auto_hedge(hedge_needed)
 
     async def handle_emergency(self, reason: str, exit_position: bool = False):
         """[통합 비상 대응]"""
@@ -453,21 +425,20 @@ class MarketMakerBot:
         if not yes_book or not no_book: 
             await self.update_orderbook()
             return
-        # 변동성 각각 추출
-        vol_yes = float(yes_book.get("volatility_1h", 0.005))
-        vol_no = float(no_book.get("volatility_1h", 0.005))
+        # 최우선 호가 추출
+        y_bb = float(yes_book['bids'][0][0] if yes_book.get('bids') else 0.5)
+        y_ba = float(yes_book['asks'][0][0] if yes_book.get('asks') else 0.5)
+        n_bb = float(no_book['bids'][0][0] if no_book.get('bids') else 0.5)
+        n_ba = float(no_book['asks'][0][0] if no_book.get('asks') else 0.5)
 
-        y_bb, y_ba = (float(yes_book['bids'][0]['price']) if yes_book.get('bids') else 0.0), \
-                     (float(yes_book['asks'][0]['price']) if yes_book.get('asks') else 1.0)
-        n_bb, n_ba = (float(no_book['bids'][0]['price']) if no_book.get('bids') else 0.0), \
-                     (float(no_book['asks'][0]['price']) if no_book.get('asks') else 1.0)
-
-        yes_q, no_q = self.quote_engine.generate_quotes(
-            self.current_market_id, y_bb, y_ba, n_bb, n_ba,
-            self.yes_token_id, self.no_token_id, self.spread_cents, self.min_size,
-            self.current_tick_size, 
-            yes_vol_1h=vol_yes, no_vol_1h=vol_no # 각각 전달
+        # [수정] QuoteEngine 인자값 최적화 (불필요한 vol, size 제거)
+        yes_quote, no_quote = self.quote_engine.generate_quotes(
+            self.current_market_id, 
+            y_bb, y_ba, n_bb, n_ba,
+            self.yes_token_id, self.no_token_id,
+            tick_size=self.current_tick_size
         )
+
         await self._cancel_stale_orders()
         
         if yes_quote:
@@ -725,4 +696,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
 
         pass
+
 
