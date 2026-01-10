@@ -220,7 +220,11 @@ class MarketMakerBot:
             if not tid: continue
             book = await self.honeypot_service.get_orderbook(session, tid)
             if book and "bids" in book:
-                self.orderbooks[tid] = book
+                # 데이터를 저장할 때 정렬하여 저장
+                self.orderbooks[tid] = {
+                    "bids": self._sort_book(book.get("bids", []), reverse=True),
+                    "asks": self._sort_book(book.get("asks", []))
+                }
 
     # =========================================================================
     # 3. Event Handlers (웹소켓 데이터 수신)
@@ -234,12 +238,11 @@ class MarketMakerBot:
         book_data = data.get("book") if data.get("book") else data
     
         if asset_id and "bids" in book_data:
-            # 오더북 리스트만 안전하게 추출하여 저장
+            # Bids는 내림차순(높은 가격부터), Asks는 오름차순(낮은 가격부터) 정렬
             self.orderbooks[asset_id] = {
-                "bids": book_data.get("bids", []),
-                "asks": book_data.get("asks", [])
+                "bids": self._sort_book(book_data.get("bids", []), reverse=True),
+                "asks": self._sort_book(book_data.get("asks", []))
             }
-            # 실시간 방어 로직 트리거
             asyncio.create_task(self.check_and_defend_orders())
 
     def _handle_trade_update(self, data: dict[str, Any]):
@@ -696,6 +699,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
 
         pass
+
 
 
 
