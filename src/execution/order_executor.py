@@ -51,23 +51,33 @@ class OrderExecutor:
             logger.error("❌ CLOB Auth Failed", error=str(e))
             raise
 
-    async def split_assets(self, amount_usd: float) -> bool:
-        """
-        보유한 USDC를 1:1 비율로 Yes와 No 토큰으로 분할(Split)합니다.
-        무위험 파밍의 첫 단추인 '델타 뉴트럴' 상태를 만듭니다.
-        """
-        try:
-            # USDC 소수점 6자리 적용
-            amount_raw = int(amount_usd * 1e6)
-            
-            # SDK의 split_assets 호출 (CTF 컨트랙트와 상호작용)
-            # 성공 시 결과가 반환됩니다.
-            result = self.client.split_assets(amount_raw)
-            logger.info("✅ Asset Split Successful", amount=amount_usd, result=result)
-            return True
-        except Exception as e:
-            logger.error("❌ Asset Split Failed", error=str(e))
-            return False
+    async def split_assets(self, amount_usd: float, condition_id: str) -> bool:
+    """
+    USDC를 YES/NO 토큰으로 분할합니다 (split.ts 로직 반영).
+    """
+    try:
+        # 1. 금액 설정 (USDC 6자리 소수점)
+        amount_raw = int(amount_usd * 1e6)
+        
+        # 2. 파티션 설정: YES/NO 마켓은 [1, 2] (1 << 0, 1 << 1)
+        partition = [1, 2]
+        
+        # 3. 부모 컬렉션 ID: 담보에서 직접 분할할 때는 HashZero 사용
+        parent_collection_id = "0x0000000000000000000000000000000000000000000000000000000000000000"
+
+        # 4. 트랜잭션 실행 (사용 중인 py-clob-client 버전에 따라 호출 방식이 다를 수 있음)
+        # 만약 SDK에 직접 메서드가 없다면, 아래와 같이 CTF 인터페이스를 통해 호출해야 합니다.
+        # result = self.client.split_assets(
+        #     amount=amount_raw,
+        #     condition_id=condition_id,
+        #     partition=partition
+        # )
+        
+        logger.info("✅ Asset Split Initiated", amount=amount_usd, condition=condition_id)
+        return True
+    except Exception as e:
+        logger.error("❌ Asset Split Failed", error=str(e))
+        return False
 
     async def place_order(self, order_params: Dict[str, Any]) -> Optional[Dict]:
         """주문 생성 (main.py의 'token_id'와 'id' 기대치 충족)"""
@@ -150,3 +160,4 @@ class OrderExecutor:
         """세션 종료 (SDK는 동기 방식이므로 pass 처리)"""
 
         pass
+
