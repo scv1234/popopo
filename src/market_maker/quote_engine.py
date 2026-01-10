@@ -39,6 +39,7 @@ class QuoteEngine:
         no_best_bid: float, no_best_ask: float,
         yes_token_id: str, no_token_id: str, 
         tick_size: float = 0.01,
+        **kwargs # 추가 인자 무시를 위해 kwargs 추가
     ) -> tuple[Quote | None, Quote | None]:
         """
         [무위험 리워드 파밍 전략]
@@ -75,9 +76,11 @@ class QuoteEngine:
                 diff = target_total - (y_price + n_price)
                 if y_price > n_price: y_price += diff
                 else: n_price += diff
+                y_price = self.ceil_to_tick(y_price, tick_size)
+                n_price = self.ceil_to_tick(n_price, tick_size)
 
-            yes_quote = Quote("SELL", self.ceil_to_tick(y_price, tick_size), yes_qty, market_id, yes_token_id)
-            no_quote = Quote("SELL", self.ceil_to_tick(n_price, tick_size), no_qty, market_id, no_token_id)
+            yes_quote = Quote("SELL", y_price, yes_qty, market_id, yes_token_id)
+            no_quote = Quote("SELL", n_price, no_qty, market_id, no_token_id)
 
         # --- Case 2: Yes만 남은 경우 (No가 먼저 팔린 상황) ---
         elif yes_qty > 0:
@@ -107,3 +110,4 @@ class QuoteEngine:
     def update_last_sold_price(self, token_type: str, price: float):
         """체결 시 판매가를 기록 (main.py의 핸들러에서 호출 필요)"""
         self.last_sold_prices[token_type.upper()] = price
+
