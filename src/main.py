@@ -123,6 +123,26 @@ class MarketMakerBot:
         await self.order_executor.close()
         await self.auto_redeem.close()
 
+    async def execute_manual_mint(self, amount: float) -> bool:
+        """프론트엔드에서 설정한 금액만큼 USDC를 쪼개서(Split) 무위험 재고를 확보합니다."""
+        try:
+            # 1. 지갑의 실제 USDC 잔고 확인
+            balance = await self.order_executor.get_usdc_balance()
+            if balance < amount:
+                logger.error("insufficient_usdc_balance", available=balance, requested=amount)
+                return False
+
+            # 2. 거래소 컨트랙트를 통해 Split 실행
+            success = await self.order_executor.split_assets(amount)
+            if success:
+                # 3. 봇의 인벤토리 메모리에 반영 (Yes +100, No +100 식)
+                self.inventory_manager.record_minting(amount)
+                logger.info("manual_minting_completed", amount=amount)
+                return True
+        except Exception as e:
+            logger.error("manual_minting_failed", error=str(e))
+        return False
+
     # =========================================================================
     # 2. Market Discovery & State Management (마켓 탐색 및 상태 변경)
     # =========================================================================
@@ -230,8 +250,11 @@ class MarketMakerBot:
         token_id = data.get("token_id")
         side = data.get("side")
 
-        # [수정] 삭제 전 주문 정보를 미리 복사 (가장 먼저 수행)
-        order_info = self.open_orders.get(order_id).copy() if order_id and order_id in self.open_orders else None
+        # [수정] SELL(매도) 체결 시, QuoteEngine에 판매가 기록 (원금 사수용)
+        if side == "SELL":
+            token_type = "YES" if token_id == self.yes_token_id else "NO"
+            self.quote_engine.update_last_sold_price(token_type, actual_price)
+            logger.info(f"recorded_sold_price", type=token_type, price=actual_price)
         
         # 1. 인벤토리 즉시 업데이트
         yes_delta = size if token_id == self.yes_token_id and side == "BUY" else (-size if token_id == self.yes_token_id else 0)
@@ -441,8 +464,9 @@ class MarketMakerBot:
 
         yes_book = self.orderbooks.get(self.yes_token_id, {})
         no_book = self.orderbooks.get(self.no_token_id, {})
-        if not yes_book or not no_book: await self.update_orderbook()
-
+        if not yes_book or not no_book: 
+            await self.update_orderbook()
+            return
         # 변동성 각각 추출
         vol_yes = float(yes_book.get("volatility_1h", 0.005))
         vol_no = float(no_book.get("volatility_1h", 0.005))
@@ -458,7 +482,12 @@ class MarketMakerBot:
             self.current_tick_size, 
             yes_vol_1h=vol_yes, no_vol_1h=vol_no # 각각 전달
         )
-        await self._cancel_stale_orders()   
+        await self._cancel_stale_orders()
+        
+        if yes_quote:
+            await self._place_quote(yes_quote, "YES")
+        if no_quote:
+            await self._place_quote(no_quote, "NO")
 
     async def _place_quote(self, quote: Any, outcome: str, is_manual: bool = False):
         """
@@ -708,4 +737,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(bootstrap(settings))
     except KeyboardInterrupt:
+
         pass
