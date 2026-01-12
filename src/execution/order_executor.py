@@ -1,7 +1,7 @@
 # src/execution/order_executor.py
 from __future__ import annotations
-
 import asyncio
+import httpx
 from typing import Any, Dict, Optional, List
 import structlog
 from web3 import Web3
@@ -12,191 +12,208 @@ from src.polymarket.order_signer import OrderSigner
 
 logger = structlog.get_logger(__name__)
 
-# [수정] 공식 Polymarket CTF(Conditional Tokens Framework) 컨트랙트 주소 (Polygon)
-CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045" 
+CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+
+SAFE_ABI = [
+    {"inputs":[{"internalType":"address","name":"to","type":"address"},{"internalType":"uint256","name":"value","type":"uint256"},{"internalType":"bytes","name":"data","type":"bytes"},{"internalType":"uint8","name":"operation","type":"uint8"},{"internalType":"uint256","name":"safeTxGas","type":"uint256"},{"internalType":"uint256","name":"baseGas","type":"uint256"},{"internalType":"uint256","name":"gasPrice","type":"uint256"},{"internalType":"address","name":"gasToken","type":"address"},{"internalType":"address","name":"refundReceiver","type":"address"},{"internalType":"bytes","name":"signatures","type":"bytes"}],"name":"execTransaction","outputs":[{"internalType":"bool","name":"success","type":"bool"}],"stateMutability":"payable","type":"function"}
+]
+
+CTF_ABI = [
+    {"inputs":[{"internalType":"contract IERC20","name":"collateralToken","type":"address"},{"internalType":"bytes32","name":"parentCollectionId","type":"bytes32"},{"internalType":"bytes32","name":"conditionId","type":"bytes32"},{"internalType":"uint256[]","name":"partition","type":"uint256[]"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"splitPosition","outputs":[],"stateMutability":"nonpayable","type":"function"},
+    {"inputs":[{"internalType":"contract IERC20","name":"collateralToken","type":"address"},{"internalType":"bytes32","name":"parentCollectionId","type":"bytes32"},{"internalType":"bytes32","name":"conditionId","type":"bytes32"},{"internalType":"uint256[]","name":"partition","type":"uint256[]"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"mergePositions","outputs":[],"stateMutability":"nonpayable","type":"function"}
+]
+
+ERC20_ABI = [
+    {"constant":True,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"},
+    {"constant":True,"inputs":[{"name":"_owner","type":"address"},{"name":"_spender","type":"address"}],"name":"allowance","outputs":[{"name":"","type":"uint256"}],"type":"function"},
+    {"constant":False,"inputs":[{"name":"_spender","type":"address"},{"name":"_value","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"type":"function"}
+]
 
 class OrderExecutor:
     def __init__(self, settings: Settings, order_signer: OrderSigner):
         self.settings = settings
         self.order_signer = order_signer
         self.w3 = Web3(Web3.HTTPProvider(settings.rpc_url))
+        self.safe_address = Web3.to_checksum_address(settings.public_address)
         
-        # 2. ClobClient 생성자 수정
-        # [핵심] funder에 EOA 주소가 아닌 'Safe 지갑 주소'를 넣어야 합니다.
-        # signature_type=2는 Safe 지갑을 의미합니다.
         self.client = ClobClient(
             host=settings.polymarket_api_url,
             key=self.order_signer.get_private_key(),
             chain_id=137,
-            signature_type=2,                  # 정수 2 직접 입력
-            funder=settings.public_address     # [수정] EOA 대신 Safe 주소 입력
+            signature_type=2,
+            funder=self.safe_address
         )
-        
-        # 3. 객체 속성 일치 (SDK 내부 상태 동기화)
         if settings.public_address:
             self.client.address = settings.public_address
             
-        self.safe_address = settings.public_address
-        logger.info("✅ ClobClient Initialized for Safe", address=self.safe_address)
+        self.ctf_contract = self.w3.eth.contract(address=Web3.to_checksum_address(CTF_ADDRESS), abi=CTF_ABI)
+        self.safe_contract = self.w3.eth.contract(address=self.safe_address, abi=SAFE_ABI)
+        self.usdc_contract = self.w3.eth.contract(address=Web3.to_checksum_address(USDC_ADDRESS), abi=ERC20_ABI)
+
+    async def get_dynamic_gas_fees(self):
+        """[참고: orderExecutor.ts] Polygon Gas Station V2를 사용한 동적 가스비 산출"""
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get("https://gasstation.polygon.technology/v2", timeout=5.0)
+                if response.status_code != 200:
+                    raise Exception(f"Gas API Status {response.status_code}")
+                
+                data = response.json()
+                fast = data['fast']
+                
+                # TS 로직 반영: Priority 1.3배, Max 1.5배 적용
+                priority_fee = fast['maxPriorityFee'] * 1.3
+                max_fee = fast['maxFee'] * 1.5
+                
+                return {
+                    'maxPriorityFeePerGas': self.w3.to_wei(round(priority_fee, 9), 'gwei'),
+                    'maxFeePerGas': self.w3.to_wei(round(max_fee, 9), 'gwei')
+                }
+        except Exception as e:
+            # API 실패 시 백업: 현재 가스 시세의 2.5배 사용
+            logger.warn(f"⚠️ 가스 API 실패, 백업 로직 가동: {str(e)}")
+            base_fee = self.w3.eth.gas_price
+            return {
+                'maxPriorityFeePerGas': int(base_fee * 2.5),
+                'maxFeePerGas': int(base_fee * 3.0) 
+            }
+
+    async def _execute_via_proxy(self, target_address: str, data: bytes) -> bool:
+        """EOA 가스비 지불 + Proxy 자산 실행 통합 함수"""
+        try:
+            signer_addr = self.order_signer.get_address()
+            signature = "0x000000000000000000000000" + signer_addr[2:].lower() + \
+                        "0000000000000000000000000000000000000000000000000000000000000000" + "01"
+            
+            fees = await self.get_dynamic_gas_fees()
+            
+            txn_params = {
+                'from': signer_addr,
+                'nonce': self.w3.eth.get_transaction_count(signer_addr),
+                'gas': 600000,
+                'maxFeePerGas': fees['maxFeePerGas'],
+                'maxPriorityFeePerGas': fees['maxPriorityFeePerGas'],
+                'type': 2 # EIP-1559 트랜잭션
+            }
+
+            txn = self.safe_contract.functions.execTransaction(
+                Web3.to_checksum_address(target_address),
+                0, data, 0, 0, 0, 0,
+                "0x0000000000000000000000000000000000000000",
+                "0x0000000000000000000000000000000000000000",
+                signature
+            ).build_transaction(txn_params)
+
+            signed_txn = self.w3.eth.account.sign_transaction(txn, self.order_signer.get_private_key())
+            tx_hash = self.w3.eth.send_raw_transaction(signed_txn.raw_transaction)
+            
+            logger.info("🚀 Proxy Transaction Sent", tx_hash=tx_hash.hex(), 
+                        priority_gwei=fees['maxPriorityFeePerGas']/1e9)
+            
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+            if receipt.status == 1:
+                logger.info("✅ Proxy Transaction Confirmed")
+                return True
+            return False
+        except Exception as e:
+            logger.error("❌ Proxy Execution Failed", error=str(e))
+            return False
+
+    async def split_assets(self, amount_usd: float, condition_id: str) -> bool:
+        """Proxy를 통한 자산 분할 (Split)"""
+        try:
+            amount_raw = int(amount_usd * 1e6)
+            allowance = self.usdc_contract.functions.allowance(self.safe_address, Web3.to_checksum_address(CTF_ADDRESS)).call()
+            if allowance < amount_raw:
+                logger.info("⏳ Proxy USDC Allowance 부족. 자동 Approve 중...")
+                approve_data = self.usdc_contract.encode_abi("approve", [Web3.to_checksum_address(CTF_ADDRESS), 2**256 - 1])
+                await self._execute_via_proxy(USDC_ADDRESS, approve_data)
+
+            parent_id = "0x" + "0" * 64
+            partition = [1, 2]
+            call_data = self.ctf_contract.encode_abi("splitPosition", [
+                Web3.to_checksum_address(USDC_ADDRESS), parent_id, condition_id, partition, amount_raw
+            ])
+            return await self._execute_via_proxy(CTF_ADDRESS, call_data)
+        except Exception as e:
+            logger.error("❌ Split Failed", error=str(e))
+            return False
+
+    async def merge_assets(self, amount_shares: float, condition_id: str) -> bool:
+        """Proxy를 통한 자산 병합 (Merge)"""
+        try:
+            amount_raw = int(amount_shares * 1e6)
+            parent_id = "0x" + "0" * 64
+            partition = [1, 2]
+            call_data = self.ctf_contract.encode_abi("mergePositions", [
+                Web3.to_checksum_address(USDC_ADDRESS), parent_id, condition_id, partition, amount_raw
+            ])
+            return await self._execute_via_proxy(CTF_ADDRESS, call_data)
+        except Exception as e:
+            logger.error("❌ Merge Failed", error=str(e))
+            return False
 
     async def initialize(self):
-        """API 자격 증명 유도 및 설정 (L2 인증)"""
         try:
-            logger.info("initializing_clob_auth")
-            
-            # API Creds 유도 (기존의 수동 HMAC 생성을 대체)
             api_creds = self.client.create_or_derive_api_creds()
             self.client.set_api_creds(api_creds)
-            
-            logger.info("✅ CLOB Auth Initialized", 
-                        address=self.client.get_address(),
-                        mode=self.client.mode)
+            logger.info("✅ CLOB Auth Initialized")
         except Exception as e:
             logger.error("❌ CLOB Auth Failed", error=str(e))
             raise
 
-    async def split_assets(self, amount_usd: float, condition_id: str) -> bool:
-        """실제 Polygon 메인넷에서 USDC를 YES/NO로 분할(Mint)합니다."""
-        try:
-            target_ctf = Web3.to_checksum_address(CTF_ADDRESS)
-            collateral_token = Web3.to_checksum_address(USDC_ADDRESS)
-            amount_raw = int(amount_usd * 1e6)
-            
-            # 1. 트랜잭션 기본 설정
-            from_addr = Web3.to_checksum_address(self.safe_address)
-            nonce = self.w3.eth.get_transaction_count(self.order_signer.get_address())
-            
-            # 2. ABI 및 컨트랙트 객체
-            ctf_abi = [
-                {"inputs":[{"internalType":"contract IERC20","name":"collateralToken","type":"address"},{"internalType":"bytes32","name":"parentCollectionId","type":"bytes32"},{"internalType":"bytes32","name":"conditionId","type":"bytes32"},{"internalType":"uint256[]","name":"partition","type":"uint256[]"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"splitPosition","outputs":[],"stateMutability":"nonpayable","type":"function"}
-            ]
-            contract = self.w3.eth.contract(address=target_ctf, abi=ctf_abi)
-            
-            # 3. 트랜잭션 빌드
-            # parent_id는 0x00...00 (HashZero)
-            parent_id = "0x" + "0" * 64
-            partition = [1, 2] # YES, NO 분할
-            
-            txn = contract.functions.splitPosition(
-                collateral_token, parent_id, condition_id, partition, amount_raw
-            ).build_transaction({
-                'from': self.order_signer.get_address(),
-                'gas': 300000,
-                'gasPrice': self.w3.eth.gas_price,
-                'nonce': nonce,
-            })
-            
-            # 4. 서명 및 전송
-            signed_txn = self.w3.eth.account.sign_transaction(txn, self.order_signer.get_private_key())
-            tx_hash = self.w3.eth.send_raw_transaction(signed_txn.rawTransaction)
-            
-            logger.info("🚀 Split Transaction Sent", tx_hash=tx_hash.hex())
-            
-            # 영수증 대기 (성공 확인)
-            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-            if receipt.status == 1:
-                logger.info("✅ Split Transaction Confirmed")
-                return True
-            return False
-            
-        except Exception as e:
-            logger.error("❌ Asset Split Failed", error=str(e))
-            return False
-
-    async def check_and_set_allowance(self):
-        """판매(SELL)를 위해 CTF 컨트랙트에 대한 토큰 사용 승인을 수행합니다."""
-        try:
-            target_ctf = Web3.to_checksum_address(CTF_ADDRESS)
-            # CTF 컨트랙트는 ERC1155 기반이므로 setApprovalForAll을 사용합니다.
-            abi = [{"inputs":[{"internalType":"address","name":"operator","type":"address"},{"internalType":"bool","name":"approved","type":"bool"}],"name":"setApprovalForAll","outputs":[],"stateMutability":"nonpayable","type":"function"}]
-            contract = self.w3.eth.contract(address=target_ctf, abi=abi)
-            
-            # Polymarket Exchange(또는 Proxy) 주소에 대한 승인이 필요할 수 있습니다.
-            # 보통 CLOB 클라이언트가 내부적으로 처리하나, 수동으로 필요할 경우를 대비합니다.
-            # 이 코드는 봇 시작 시(initialize) 한 번 실행해주는 것이 좋습니다.
-            pass 
-        except Exception as e:
-            logger.error("❌ Allowance Setting Failed", error=str(e))
-
     async def place_order(self, order_params: Dict[str, Any]) -> Optional[Dict]:
-        """주문 생성 (main.py의 'token_id'와 'id' 기대치 충족)"""
         try:
-            # 변수명 통일: main.py에서 보내는 token_id를 사용
             order_args = OrderArgs(
                 token_id=order_params["token_id"], 
                 price=float(order_params["price"]),
                 size=float(order_params["size"]),
                 side=order_params["side"].upper()
             )
-
             signed_order = self.client.create_order(order_args)
             result = self.client.post_order(signed_order, OrderType.GTC)
-            
-            # main.py 호환성: 'orderID'를 'id'로 복사하여 반환
             if result and "orderID" in result:
                 result["id"] = result["orderID"]
-            
             return result
         except Exception as e:
             logger.error("❌ Order Placement Failed", error=str(e))
             return None
 
-    async def place_market_order(self, market_id: str, side: str, size: float, token_id: str) -> Optional[Dict]:
-        """긴급 청산용 주문 (유리한 가격으로 지정가 주문 제출)"""
-        price = 0.99 if side == "BUY" else 0.01
-        return await self.place_order({
-            "side": side,
-            "size": size,
-            "price": price,
-            "token_id": token_id
-        })
-
     async def get_usdc_balance(self) -> float:
-        """현재 계정의 USDC 잔고 조회"""
         try:
-            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-            balance_data = self.client.get_balance_allowance(params=params)
-            
-            # 6자리 소수점(USDC) 적용하여 변환
-            return float(balance_data.get("balance", 0)) / 1e6
+            balance = self.usdc_contract.functions.balanceOf(self.safe_address).call()
+            return float(balance) / 1e6
         except Exception as e:
             logger.error("❌ Failed to fetch balance", error=str(e))
             return 0.0
 
     async def cancel_order(self, order_id: str) -> bool:
-        """개별 주문 취소"""
         try:
-            self.client.cancel(order_id)
-            logger.info("✅ Order Cancelled", order_id=order_id)
+            self.client.cancel_order({"orderID": order_id})
             return True
         except Exception as e:
             logger.error("❌ Cancel Failed", order_id=order_id, error=str(e))
             return False
 
     async def batch_cancel_orders(self, order_ids: List[str]) -> int:
-        """여러 주문 ID 일괄 취소"""
-        if not order_ids:
-            return 0
+        if not order_ids: return 0
         try:
-            self.client.cancel_orders(order_ids)
-            logger.info("✅ Batch Cancel Success", count=len(order_ids))
+            # py_clob_client 사양에 맞춤
+            for oid in order_ids:
+                self.client.cancel_order({"orderID": oid})
             return len(order_ids)
         except Exception as e:
             logger.error("❌ Batch Cancel Failed", error=str(e))
             return 0
 
     async def cancel_all_orders(self, market_id: str = None) -> bool:
-        """모든 주문 취소 (인자 허용하여 main.py와 호환성 유지)"""
         try:
             self.client.cancel_all()
-            logger.info("✅ All Orders Cancelled")
             return True
         except Exception as e:
             logger.error("❌ Cancel All Failed", error=str(e))
             return False
 
     async def close(self):
-        """세션 종료 (SDK는 동기 방식이므로 pass 처리)"""
-
         pass
