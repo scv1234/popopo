@@ -26,11 +26,15 @@ class QuoteEngine:
         self.last_sold_prices = {"YES": 0.0, "NO": 0.0}
 
     def ceil_to_tick(self, price: float, tick_size: float) -> float:
-        """틱 사이즈에 맞춰 가격을 올림 처리합니다 (매도 호가 최적화)"""
-        if tick_size <= 0: return round(price, 2)
-        precision = int(-math.log10(tick_size))
-        normalized_price = round(price / tick_size, 8)
-        return round(math.ceil(normalized_price) * tick_size, precision)
+        """틱 사이즈에 맞춰 가격을 올림 처리합니다."""
+        try:
+            if tick_size <= 0: return round(price, 2)
+            # 정밀도 계산 시 발생할 수 있는 오류 방지
+            precision = max(0, int(-math.log10(tick_size)))
+            normalized_price = round(price / tick_size, 8)
+            return round(math.ceil(normalized_price) * tick_size, precision)
+        except Exception:
+            return round(price, 2)
 
     def generate_quotes(
         self, 
@@ -110,4 +114,3 @@ class QuoteEngine:
     def update_last_sold_price(self, token_type: str, price: float):
         """체결 시 판매가를 기록 (main.py의 핸들러에서 호출 필요)"""
         self.last_sold_prices[token_type.upper()] = price
-
