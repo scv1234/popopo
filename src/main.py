@@ -49,7 +49,6 @@ class MarketMakerBot:
         self.honeypot_service = HoneypotService(settings)
         self.ws_client = PolymarketWebSocketClient(settings)
         self.order_signer = OrderSigner(settings.private_key)
-        self.order_executor = OrderExecutor(settings, self.order_signer)
         self.auto_redeem = AutoRedeem(settings)
 
         self.order_executor = OrderExecutor(settings, self.order_signer)
@@ -578,90 +577,107 @@ class MarketMakerBot:
 
     async def execute_optimizer_order(self, market_id: str, amount_usd: float, yes_id: str = None, no_id: str = None) -> bool:
         """
-        [개선안: 정확한 Condition ID 매핑 및 웹사이트 동기화]
+        [Neg Risk 대응] 정확한 마켓 매칭 및 타겟 고정 로직 (정밀 매칭 적용)
         """
         try:
             logger.info("🚀 optimizer_start", market_id=market_id, amount=amount_usd)
-            
-            # 1. 자산 분할에 필요한 진짜 정보(conditionId, clobTokenIds) 확보
             session = await self.honeypot_service.get_session()
             
-            # Gamma API 조회 (market_id가 slug일 수도, ID일 수도 있으므로 유연하게 처리)
-            # 웹사이트와 동일한 토큰을 만들려면 'conditionId' 필드가 절대적으로 중요합니다.
-            gamma_url = f"{self.honeypot_service.GAMMA_API}?id={market_id}" 
-            
+            # 1. API 쿼리 파라미터 유연화
+            if market_id.startswith("0x"):
+                gamma_url = f"{self.honeypot_service.GAMMA_API}?conditionId={market_id}"
+            else:
+                gamma_url = f"{self.honeypot_service.GAMMA_API}?id={market_id}" 
+
             async with session.get(gamma_url) as res:
                 if res.status == 200:
                     data = await res.json()
                     if isinstance(data, list) and len(data) > 0:
-                        m = data[0]
+                        # [핵심 수정] 대소문자 무관, 정확히 일치하는 후보만 탐색 (Fallback 제거)
+                        target_id_clean = market_id.lower().strip()
+                        m = None
+                        for item in data:
+                            cond_id = str(item.get("conditionId", "")).lower()
+                            num_id = str(item.get("id", "")).lower()
+                            if cond_id == target_id_clean or num_id == target_id_clean:
+                                m = item
+                                break
                         
-                        # [핵심] 웹사이트가 사용하는 온체인 conditionId를 가져옴
+                        if not m:
+                            logger.error("❌ 일치하는 후보를 찾지 못했습니다. (목록에 없음)", target=market_id)
+                            return False
+                        
                         found_cond_id = m.get("conditionId")
                         if found_cond_id:
                             self.current_condition_id = found_cond_id
                             logger.info("🎯 found_real_condition_id", condition_id=found_cond_id)
                         
-                        # Token ID (YES/NO) 추출
+                        # Token ID (YES/NO) 추출 (항상 API 최신 정보 우선)
                         raw_ids = m.get("clobTokenIds", "[]")
                         token_ids = json.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
+                        
                         if len(token_ids) >= 2:
                             yes_id, no_id = token_ids[0], token_ids[1]
+                            self.yes_token_id, self.no_token_id = yes_id, no_id
                             logger.info("🎯 found_token_ids", yes=yes_id, no=no_id)
+                    else:
+                        logger.error("❌ API 응답이 비어있습니다.", url=gamma_url)
+                        return False
 
-            # 최종 검증
+            # 데이터 복구 검증
             if not yes_id or not no_id or not self.current_condition_id:
-                logger.error("❌ 정보 복구 실패: Gamma API 데이터를 확인하세요.")
+                logger.error("❌ 정보 복구 실패: API 데이터를 확인하세요.", market_id=market_id)
                 return False
 
-            # 2. Proxy(Safe) 기반 자산 분할 실행
-            # 이제 정확한 self.current_condition_id를 사용하여 웹과 동일한 Token ID를 생성합니다.
+            # 2. 가스리스 자산 분할 실행
             split_success = await self.order_executor.split_assets(amount_usd, self.current_condition_id)
             if not split_success:
-                logger.error("❌ optimizer_minting_failed_at_proxy")
+                logger.error("❌ optimizer_mint_failed")
                 return False
 
-            # 3. 인벤토리 수동 업데이트
+            # 3. 봇의 전역 타겟을 현재 마켓으로 즉시 고정
+            await self._apply_market_target({
+                'market_id': str(m.get('id')), 
+                'condition_id': self.current_condition_id,
+                'yes_token_id': self.yes_token_id,
+                'no_token_id': self.no_token_id,
+                'min_size': m.get('min_size', 20.0),
+                'title': m.get('question', 'Manual Target')
+            }, use_lock=True)
+
             self.inventory_manager.update_inventory(amount_usd, amount_usd)
-            logger.info("✅ optimizer_minting_success", amount=amount_usd)
 
-            # 4. 데이터 동기화
-            await self.ws_client.subscribe_orderbook(yes_id)
-            await self.ws_client.subscribe_orderbook(no_id)
-            await self.update_orderbook()
-
-            # 5. [파밍 시작] 매도(SELL) 주문 배치
             async with self.state_lock:
                 await self.refresh_quotes()
             
-            logger.info("💰 optimizer_farming_started_successfully")
+            logger.info("💰 Manual Farming Started & Target Locked", market=m.get("question"))
             return True
 
         except Exception as e:
             logger.error("❌ optimizer_order_exception", error=str(e))
             return False
 
-        def _extract_best(self, book):
-            """호가 데이터에서 최우선 호가를 안전하게 추출"""
-            bids = book.get("bids", [])
-            asks = book.get("asks", [])
-            bb = self._extract_price(bids[0]) if bids else 0.49
-            ba = self._extract_price(asks[0]) if asks else 0.51
-            return bb, ba
+    def _extract_best(self, book):
+        """호가 데이터에서 최우선 호가를 안전하게 추출"""
+        bids = book.get("bids", [])
+        asks = book.get("asks", [])
+        bb = self._extract_price(bids[0]) if bids else 0.49
+        ba = self._extract_price(asks[0]) if asks else 0.51
+        return bb, ba
 
-        async def cancel_single_order(self, order_id: str) -> bool:
-            """특정 ID의 주문을 취소하고 관리 목록에서 제거합니다."""
-            logger.info("request_cancel_single_order", id=order_id)
+    async def cancel_single_order(self, order_id: str) -> bool:
+        """특정 ID의 주문을 취소하고 관리 목록에서 제거합니다."""
+        logger.info("request_cancel_single_order", id=order_id)
             
-            # OrderExecutor를 통해 거래소에 취소 요청
-            success = await self.order_executor.cancel_order(order_id)
+        # OrderExecutor를 통해 거래소에 취소 요청
+        success = await self.order_executor.cancel_order(order_id)
             
-            if success:
-                # 관리 목록에서 해당 ID 제거
-                self.manual_order_ids.discard(order_id)
-                self.open_orders.pop(order_id, None)
-                return True
-            return False
+        if success:
+            # 관리 목록에서 해당 ID 제거
+            self.manual_order_ids.discard(order_id)
+            self.open_orders.pop(order_id, None)
+            return True
+        return False
 
     async def batch_cancel_manual_orders(self) -> bool:
         """모든 수동 주문을 일괄 취소합니다."""

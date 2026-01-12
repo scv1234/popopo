@@ -6,7 +6,12 @@ from typing import Any, Dict, Optional, List
 import structlog
 from web3 import Web3
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType, AssetType, BalanceAllowanceParams
+from py_clob_client.clob_types import OrderArgs, OrderType
+# 가스리스 실행을 위한 라이브러리 추가
+from py_builder_relayer_client.client import RelayClient
+# SafeTransaction 클래스 임포트 추가
+from py_builder_signing_sdk.config import BuilderConfig, BuilderApiKeyCreds
+from py_builder_relayer_client.models import SafeTransaction, OperationType
 from src.config import Settings
 from src.polymarket.order_signer import OrderSigner
 
@@ -15,10 +20,7 @@ logger = structlog.get_logger(__name__)
 CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 
-SAFE_ABI = [
-    {"inputs":[{"internalType":"address","name":"to","type":"address"},{"internalType":"uint256","name":"value","type":"uint256"},{"internalType":"bytes","name":"data","type":"bytes"},{"internalType":"uint8","name":"operation","type":"uint8"},{"internalType":"uint256","name":"safeTxGas","type":"uint256"},{"internalType":"uint256","name":"baseGas","type":"uint256"},{"internalType":"uint256","name":"gasPrice","type":"uint256"},{"internalType":"address","name":"gasToken","type":"address"},{"internalType":"address","name":"refundReceiver","type":"address"},{"internalType":"bytes","name":"signatures","type":"bytes"}],"name":"execTransaction","outputs":[{"internalType":"bool","name":"success","type":"bool"}],"stateMutability":"payable","type":"function"}
-]
-
+# Safe ABI는 릴레이어 클라이언트가 내부적으로 처리하므로 명시적 호출용 외에는 필요성이 줄어듭니다.
 CTF_ABI = [
     {"inputs":[{"internalType":"contract IERC20","name":"collateralToken","type":"address"},{"internalType":"bytes32","name":"parentCollectionId","type":"bytes32"},{"internalType":"bytes32","name":"conditionId","type":"bytes32"},{"internalType":"uint256[]","name":"partition","type":"uint256[]"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"splitPosition","outputs":[],"stateMutability":"nonpayable","type":"function"},
     {"inputs":[{"internalType":"contract IERC20","name":"collateralToken","type":"address"},{"internalType":"bytes32","name":"parentCollectionId","type":"bytes32"},{"internalType":"bytes32","name":"conditionId","type":"bytes32"},{"internalType":"uint256[]","name":"partition","type":"uint256[]"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"mergePositions","outputs":[],"stateMutability":"nonpayable","type":"function"}
@@ -37,6 +39,7 @@ class OrderExecutor:
         self.w3 = Web3(Web3.HTTPProvider(settings.rpc_url))
         self.safe_address = Web3.to_checksum_address(settings.public_address)
         
+        # 1. CLOB Client 초기화
         self.client = ClobClient(
             host=settings.polymarket_api_url,
             key=self.order_signer.get_private_key(),
@@ -46,110 +49,125 @@ class OrderExecutor:
         )
         if settings.public_address:
             self.client.address = settings.public_address
+
+        # 2. Gasless 실행을 위한 RelayClient 설정
+        builder_creds = BuilderApiKeyCreds(
+            key=settings.polymarket_builder_api_key,
+            secret=settings.polymarket_builder_secret,
+            passphrase=settings.polymarket_builder_passphrase
+        )
+        builder_config = BuilderConfig(local_builder_creds=builder_creds)
+        
+        # [수정] 확인된 시그니처에 맞춰 tx_type 제거
+        self.relay_client = RelayClient(
+            relayer_url="https://relayer-v2.polymarket.com/", 
+            chain_id=137,
+            private_key=self.order_signer.get_private_key(), 
+            builder_config=builder_config
+        )
             
         self.ctf_contract = self.w3.eth.contract(address=Web3.to_checksum_address(CTF_ADDRESS), abi=CTF_ABI)
-        self.safe_contract = self.w3.eth.contract(address=self.safe_address, abi=SAFE_ABI)
         self.usdc_contract = self.w3.eth.contract(address=Web3.to_checksum_address(USDC_ADDRESS), abi=ERC20_ABI)
 
-    async def get_dynamic_gas_fees(self):
-        """[참고: orderExecutor.ts] Polygon Gas Station V2를 사용한 동적 가스비 산출"""
+    async def _execute_gasless(self, transactions: List[Dict[str, Any]], label: str = "Task") -> bool:
+        """폴리마켓 릴레이어를 통한 가스리스 실행 핵심 함수"""
         try:
-            async with httpx.AsyncClient() as client:
-                response = await client.get("https://gasstation.polygon.technology/v2", timeout=5.0)
-                if response.status_code != 200:
-                    raise Exception(f"Gas API Status {response.status_code}")
-                
-                data = response.json()
-                fast = data['fast']
-                
-                # TS 로직 반영: Priority 1.3배, Max 1.5배 적용
-                priority_fee = fast['maxPriorityFee'] * 1.3
-                max_fee = fast['maxFee'] * 1.5
-                
-                return {
-                    'maxPriorityFeePerGas': self.w3.to_wei(round(priority_fee, 9), 'gwei'),
-                    'maxFeePerGas': self.w3.to_wei(round(max_fee, 9), 'gwei')
-                }
-        except Exception as e:
-            # API 실패 시 백업: 현재 가스 시세의 2.5배 사용
-            logger.warn(f"⚠️ 가스 API 실패, 백업 로직 가동: {str(e)}")
-            base_fee = self.w3.eth.gas_price
-            return {
-                'maxPriorityFeePerGas': int(base_fee * 2.5),
-                'maxFeePerGas': int(base_fee * 3.0) 
-            }
+            # SafeTransaction 객체 리스트 생성 (기존 로직 유지)
+            safe_txs = [
+                SafeTransaction(
+                    to=Web3.to_checksum_address(tx["to"]),
+                    operation=OperationType.Call,
+                    data=tx["data"],
+                    value=str(tx.get("value", "0"))
+                ) for tx in transactions
+            ]
 
-    async def _execute_via_proxy(self, target_address: str, data: bytes) -> bool:
-        """EOA 가스비 지불 + Proxy 자산 실행 통합 함수"""
-        try:
-            signer_addr = self.order_signer.get_address()
-            signature = "0x000000000000000000000000" + signer_addr[2:].lower() + \
-                        "0000000000000000000000000000000000000000000000000000000000000000" + "01"
+            # 릴레이어 실행 요청
+            response = self.relay_client.execute(
+                transactions=safe_txs, 
+                metadata=label
+            )
             
-            fees = await self.get_dynamic_gas_fees()
+            # [핵심 수정] SDK 객체 속성 이름(transaction_id, transaction_hash)에 맞춰 추출
+            tx_id = getattr(response, "transaction_id", None)
+            tx_hash = getattr(response, "transaction_hash", None) or getattr(response, "hash", None)
             
-            txn_params = {
-                'from': signer_addr,
-                'nonce': self.w3.eth.get_transaction_count(signer_addr),
-                'gas': 600000,
-                'maxFeePerGas': fees['maxFeePerGas'],
-                'maxPriorityFeePerGas': fees['maxPriorityFeePerGas'],
-                'type': 2 # EIP-1559 트랜잭션
-            }
-
-            txn = self.safe_contract.functions.execTransaction(
-                Web3.to_checksum_address(target_address),
-                0, data, 0, 0, 0, 0,
-                "0x0000000000000000000000000000000000000000",
-                "0x0000000000000000000000000000000000000000",
-                signature
-            ).build_transaction(txn_params)
-
-            signed_txn = self.w3.eth.account.sign_transaction(txn, self.order_signer.get_private_key())
-            tx_hash = self.w3.eth.send_raw_transaction(signed_txn.raw_transaction)
+            if tx_id:
+                logger.info(f"🚀 Gasless {label} Submitted", tx_id=tx_id, tx_hash=tx_hash)
+                
+                # [개선] SDK 자체의 .wait() 기능을 사용하여 트랜잭션이 확정될 때까지 대기합니다.
+                # 이 함수는 릴레이어의 내부 상태를 폴링하므로 더 정확합니다.
+                # (주의: wait()는 동기 함수이므로 asyncio.to_thread를 사용하여 루프 차단을 방지합니다)
+                result = await asyncio.to_thread(response.wait)
+                
+                if result:
+                    # 결과 데이터에서 실제 블록에 기록된 해시를 가져와 로그를 찍습니다.
+                    final_hash = result.get("transactionHash") or tx_hash
+                    logger.info(f"✅ Gasless {label} Confirmed", tx_hash=final_hash)
+                    return True
+                else:
+                    logger.error(f"❌ Gasless {label} Failed in Relayer", tx_id=tx_id)
+                    return False
             
-            logger.info("🚀 Proxy Transaction Sent", tx_hash=tx_hash.hex(), 
-                        priority_gwei=fees['maxPriorityFeePerGas']/1e9)
-            
-            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
-            if receipt.status == 1:
-                logger.info("✅ Proxy Transaction Confirmed")
-                return True
+            logger.error(f"❌ Gasless {label} Submission Failed (No ID)", response=response)
             return False
+            
         except Exception as e:
-            logger.error("❌ Proxy Execution Failed", error=str(e))
+            logger.error(f"❌ Gasless Execution Error", label=label, error=str(e))
             return False
 
     async def split_assets(self, amount_usd: float, condition_id: str) -> bool:
-        """Proxy를 통한 자산 분할 (Split)"""
+        """가스리스 자산 분할 (Split)"""
         try:
             amount_raw = int(amount_usd * 1e6)
+            txs = []
+
+            # 1. Allowance 체크 및 필요 시 Approve 추가
             allowance = self.usdc_contract.functions.allowance(self.safe_address, Web3.to_checksum_address(CTF_ADDRESS)).call()
             if allowance < amount_raw:
-                logger.info("⏳ Proxy USDC Allowance 부족. 자동 Approve 중...")
                 approve_data = self.usdc_contract.encode_abi("approve", [Web3.to_checksum_address(CTF_ADDRESS), 2**256 - 1])
-                await self._execute_via_proxy(USDC_ADDRESS, approve_data)
+                txs.append({
+                    "to": USDC_ADDRESS,
+                    "data": approve_data,
+                    "value": "0"
+                })
 
+            # 2. Split Call Data 생성
             parent_id = "0x" + "0" * 64
             partition = [1, 2]
-            call_data = self.ctf_contract.encode_abi("splitPosition", [
+            split_data = self.ctf_contract.encode_abi("splitPosition", [
                 Web3.to_checksum_address(USDC_ADDRESS), parent_id, condition_id, partition, amount_raw
             ])
-            return await self._execute_via_proxy(CTF_ADDRESS, call_data)
+            txs.append({
+                "to": CTF_ADDRESS,
+                "data": split_data,
+                "value": "0"
+            })
+
+            # 릴레이어를 통해 일괄 실행 (Approve + Split)
+            return await self._execute_gasless(txs, "SplitPosition")
         except Exception as e:
             logger.error("❌ Split Failed", error=str(e))
             return False
 
     async def merge_assets(self, amount_shares: float, condition_id: str) -> bool:
-        """Proxy를 통한 자산 병합 (Merge)"""
+        """가스리스 자산 병합 (Merge)"""
         try:
             amount_raw = int(amount_shares * 1e6)
             parent_id = "0x" + "0" * 64
             partition = [1, 2]
-            call_data = self.ctf_contract.encode_abi("mergePositions", [
+            
+            merge_data = self.ctf_contract.encode_abi("mergePositions", [
                 Web3.to_checksum_address(USDC_ADDRESS), parent_id, condition_id, partition, amount_raw
             ])
-            return await self._execute_via_proxy(CTF_ADDRESS, call_data)
+            
+            transaction = {
+                "to": CTF_ADDRESS,
+                "data": merge_data,
+                "value": "0"
+            }
+            
+            return await self._execute_gasless([transaction], "MergePositions")
         except Exception as e:
             logger.error("❌ Merge Failed", error=str(e))
             return False

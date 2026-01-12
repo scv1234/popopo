@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 class HoneypotService:
     def __init__(self, settings=None):
+        self.settings = settings  # [필수 추가] scan 메서드에서 target_market_id 조회를 위해 필요
         self.params = {
             "min_daily_reward_usd": settings.min_daily_reward_usd if settings else 10,
             "max_existing_depth_usd": getattr(settings, 'max_existing_depth_usd', 5000),
@@ -317,7 +318,6 @@ class HoneypotService:
             "market_id": market.get("conditionId"),
             "condition_id": market.get("conditionId"), # [추가] 자산 분할용 condition_id
             "title": market.get("question"),
-            "title": market.get("question"),
             "score": round(final_score, 4),
             "mid_yes": round(mid_yes, 3),
             "mid_no": round(mid_no, 3),
@@ -341,47 +341,60 @@ class HoneypotService:
         }
 
     async def scan(self):
-        # 5가지 정렬 기준으로 확장
+        """[수정] 특정 마켓 우선 조회 및 가시성 개선 (print -> logger)"""
+        target_market_id = getattr(self.settings, 'market_id', None)
         sorts = ["volume24hr", "liquidity", "createdAt", "newest", "commentCount"]
         unique_markets = {}
         now = datetime.now(timezone.utc)
 
         async with aiohttp.ClientSession() as session:
-            print(f"📡 폴리마켓 광역 전수조사 시작... (기준: {len(sorts)}종 정렬)")
+            # 1. 타겟 마켓 최우선 로드
+            if target_market_id:
+                logger.info(f"🎯 타겟 마켓(ID: {target_market_id}) 우선 확인 중...")
+                url = f"{self.GAMMA_API}?conditionId={target_market_id}"
+                async with session.get(url) as res:
+                    if res.status == 200:
+                        for m in await res.json(): unique_markets[m.get('id')] = m
+
+            # 2. 광역 전수조사
+            logger.info(f"📡 폴리마켓 광역 스캔 시작 (기준: {len(sorts)}종 정렬)")
             for sort in sorts:
                 for page in range(self.params["max_pages_per_sort"]):
                     offset = page * self.params["limit"]
                     url = f"{self.GAMMA_API}?active=true&closed=false&limit={self.params['limit']}&offset={offset}&order={sort}&dir=desc"
-                    
-                    async with session.get(url) as res:
-                        if res.status != 200: break
-                        try: markets = await res.json()
-                        except: break
-                        if not markets: break
-                        
-                        for m in markets:
-                            # 10시간 필터 미리 적용 (스캔 효율성)
-                            end_date_str = m.get('endDate')
-                            if not end_date_str: continue
-                            try:
-                                end_ts = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
-                                if (end_ts - now).total_seconds() / 3600 < self.params["avoid_near_expiry_hours"]:
-                                    continue
-                                unique_markets[m.get('id')] = m
-                            except: continue
-                print(f"   - [{sort:^12}] 완료 (누적 마켓: {len(unique_markets)}개)")
+                    try:
+                        async with session.get(url) as res:
+                            if res.status != 200: break
+                            markets = await res.json()
+                            if not markets: break
+                            for m in markets:
+                                m_id = m.get('id')
+                                if m_id in unique_markets: continue
+                                try:
+                                    end_ts = datetime.fromisoformat(m.get('endDate').replace("Z", "+00:00"))
+                                    if (end_ts - now).total_seconds() / 3600 >= self.params["avoid_near_expiry_hours"]:
+                                        unique_markets[m_id] = m
+                                except: continue
+                    except Exception as e:
+                        logger.warning(f"⚠️ {sort} 스캔 중 오류: {e}")
+                        break
+                logger.info(f"   - [{sort:^12}] 완료 (누적: {len(unique_markets)}개)")
 
-            print(f"\n🔬 {len(unique_markets)}개 시장 후보 정밀 분석 중...")
+            # 3. 정밀 분석
+            logger.info(f"🔬 {len(unique_markets)}개 시장 후보 정밀 분석 중...")
             semaphore = asyncio.Semaphore(self.params["max_concurrent"])
             tasks = [self.get_market_data_complete(session, m, semaphore) for m in unique_markets.values()]
             results = await asyncio.gather(*tasks)
             
-            found = [r for r in results if r is not None]
-            found_sorted = sorted(found, key=lambda x: x['score'], reverse=True) # 정렬된 리스트 생성
+            found = []
+            for r in results:
+                if r:
+                    if target_market_id and r['condition_id'] == target_market_id:
+                        logger.info(f"📌 타겟 마켓 탐지 완료: {r['title']} (Score: {r['score']})")
+                    found.append(r)
 
-            if found_sorted or not unique_markets: # 데이터가 아예 없을 때도 캐시 갱신
-                self.update_honeypot_cache(found_sorted)
-            
-            print(f"✅ 최종 {len(found_sorted)}개의 보상 시장을 탐지했습니다.")
+            found_sorted = sorted(found, key=lambda x: x['score'], reverse=True)
+            self.update_honeypot_cache(found_sorted)
+            logger.info(f"✅ 최종 {len(found_sorted)}개의 보상 시장을 탐지했습니다.")
             return found_sorted
 
