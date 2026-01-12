@@ -176,7 +176,7 @@
         const resultDiv = document.getElementById('optimizer-result');
         if (marketData.length === 0) return;
 
-        const step = 20; const maxAllocRatio = 0.40; const minROICutoff = 0.0005; const maxAllocPerMarket = budget * maxAllocRatio;
+        const step = 20; const maxAllocRatio = 0.35; const minROICutoff = 0.0005; const maxAllocPerMarket = budget * maxAllocRatio;
         lastOptimizerAllocations = {};
         marketData.forEach(m => lastOptimizerAllocations[m.market_id] = 0);
         let remaining = budget;

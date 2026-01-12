@@ -18,7 +18,7 @@ from src.polymarket.order_signer import OrderSigner
 logger = structlog.get_logger(__name__)
 
 CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
-USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+USDC_ADDRESS = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
 
 # Safe ABI는 릴레이어 클라이언트가 내부적으로 처리하므로 명시적 호출용 외에는 필요성이 줄어듭니다.
 CTF_ABI = [
@@ -116,60 +116,51 @@ class OrderExecutor:
             logger.error(f"❌ Gasless Execution Error", label=label, error=str(e))
             return False
 
-    async def split_assets(self, amount_usd: float, condition_id: str) -> bool:
-        """가스리스 자산 분할 (Split)"""
+    async def split_assets(self, amount_usd: float, condition_id: str, collateral_token: str = None, num_outcomes: int = 2) -> bool:
+        """가스리스 자산 분할 (Split) - Native USDC 지원 및 동적 파티션"""
         try:
             amount_raw = int(amount_usd * 1e6)
+            # 인자로 받은 주소가 없으면 기본 Native USDC 사용
+            collateral_addr = Web3.to_checksum_address(collateral_token or USDC_ADDRESS)
             txs = []
 
-            # 1. Allowance 체크 및 필요 시 Approve 추가
-            allowance = self.usdc_contract.functions.allowance(self.safe_address, Web3.to_checksum_address(CTF_ADDRESS)).call()
+            # 1. 담보 자산(Native USDC 등)의 Allowance 체크 및 Approve
+            token_contract = self.w3.eth.contract(address=collateral_addr, abi=ERC20_ABI)
+            allowance = token_contract.functions.allowance(self.safe_address, Web3.to_checksum_address(CTF_ADDRESS)).call()
+            
             if allowance < amount_raw:
-                approve_data = self.usdc_contract.encode_abi("approve", [Web3.to_checksum_address(CTF_ADDRESS), 2**256 - 1])
-                txs.append({
-                    "to": USDC_ADDRESS,
-                    "data": approve_data,
-                    "value": "0"
-                })
+                approve_data = token_contract.encode_abi("approve", [Web3.to_checksum_address(CTF_ADDRESS), 2**256 - 1])
+                txs.append({"to": collateral_addr, "data": approve_data, "value": "0"})
 
-            # 2. Split Call Data 생성
+            # 2. Split Call Data 생성 (Neg Risk 대응 파티션)
             parent_id = "0x" + "0" * 64
-            partition = [1, 2]
+            partition = [2**i for i in range(num_outcomes)]
+            
             split_data = self.ctf_contract.encode_abi("splitPosition", [
-                Web3.to_checksum_address(USDC_ADDRESS), parent_id, condition_id, partition, amount_raw
+                collateral_addr, parent_id, condition_id, partition, amount_raw
             ])
-            txs.append({
-                "to": CTF_ADDRESS,
-                "data": split_data,
-                "value": "0"
-            })
+            txs.append({"to": CTF_ADDRESS, "data": split_data, "value": "0"})
 
-            # 릴레이어를 통해 일괄 실행 (Approve + Split)
-            return await self._execute_gasless(txs, "SplitPosition")
+            return await self._execute_gasless(txs, f"SplitPosition({num_outcomes} outcomes)")
         except Exception as e:
             logger.error("❌ Split Failed", error=str(e))
             return False
 
-    async def merge_assets(self, amount_shares: float, condition_id: str) -> bool:
-        """가스리스 자산 병합 (Merge)"""
+    async def merge_assets(self, amount_shares: float, condition_id: str, num_outcomes: int = 2) -> bool:
+        """가스리스 자산 병합 (Merge) - Neg Risk 및 다중 결과 마켓 지원"""
         try:
             amount_raw = int(amount_shares * 1e6)
             parent_id = "0x" + "0" * 64
-            partition = [1, 2]
+            partition = [2**i for i in range(num_outcomes)]
             
             merge_data = self.ctf_contract.encode_abi("mergePositions", [
                 Web3.to_checksum_address(USDC_ADDRESS), parent_id, condition_id, partition, amount_raw
             ])
             
-            transaction = {
-                "to": CTF_ADDRESS,
-                "data": merge_data,
-                "value": "0"
-            }
-            
-            return await self._execute_gasless([transaction], "MergePositions")
+            transaction = {"to": CTF_ADDRESS, "data": merge_data, "value": "0"}
+            return await self._execute_gasless([transaction], f"MergePositions({num_outcomes} outcomes)")
         except Exception as e:
-            logger.error("❌ Merge Failed", error=str(e))
+            logger.error(f"❌ Merge Failed (outcomes={num_outcomes})", error=str(e))
             return False
 
     async def initialize(self):
@@ -198,13 +189,15 @@ class OrderExecutor:
             logger.error("❌ Order Placement Failed", error=str(e))
             return None
 
-    async def get_usdc_balance(self) -> float:
+    async def get_usdc_balance_raw(self, token_address: str = None) -> int:
+        """지정된 토큰의 원본 잔고(Raw unit)를 가져옵니다."""
         try:
-            balance = self.usdc_contract.functions.balanceOf(self.safe_address).call()
-            return float(balance) / 1e6
+            target_token = Web3.to_checksum_address(token_address or USDC_ADDRESS)
+            contract = self.w3.eth.contract(address=target_token, abi=ERC20_ABI)
+            return contract.functions.balanceOf(self.safe_address).call()
         except Exception as e:
-            logger.error("❌ Failed to fetch balance", error=str(e))
-            return 0.0
+            logger.error("❌ Balance Fetch Error", error=str(e))
+            return 0
 
     async def cancel_order(self, order_id: str) -> bool:
         try:

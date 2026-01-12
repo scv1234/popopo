@@ -68,6 +68,7 @@ class MarketMakerBot:
         self.spread_cents = 3
         self.min_size = 20.0
         self.current_tick_size = 0.01 # 기본값
+        self.current_num_outcomes = 2
 
     # =========================================================================
     # 1. Lifecycle & Bootstrap (봇의 시작과 종료)
@@ -205,16 +206,19 @@ class MarketMakerBot:
                 await self.order_executor.cancel_all_orders(old_market_id)
                 self.open_orders.clear()
 
+            self.inventory_manager.reset()
+
             # 2. 로컬 상태 변수 업데이트
-            self.current_market_id = market_data['market_id']
+            self.current_market_id = str(market_data['market_id'])
             self.current_condition_id = market_data.get('condition_id', "") # [추가]
+            self.current_num_outcomes = market_data.get('num_outcomes', 2)
             self.yes_token_id = market_data['yes_token_id']
             self.no_token_id = market_data['no_token_id']
-            self.min_size = market_data['min_size']
+            self.min_size = market_data.get('min_size', 1.0) # 기본값 설정
             
-            logger.info("market_target_updated", 
-                        market_id=self.current_market_id, 
-                        condition_id=self.current_condition_id)
+            logger.info("🎯 market_target_updated", 
+                        title=market_data.get('title'), 
+                        market_id=self.current_market_id)
         
             # 상태 초기화
             self.orderbooks = {}
@@ -575,82 +579,79 @@ class MarketMakerBot:
                     logger.error("auto_redeem_error", error=str(e))
             await asyncio.sleep(300)
 
-    async def execute_optimizer_order(self, market_id: str, amount_usd: float, yes_id: str = None, no_id: str = None) -> bool:
+    async def execute_optimizer_order(self, market_id: str, amount_usd: float) -> bool:
         """
-        [Neg Risk 대응] 정확한 마켓 매칭 및 타겟 고정 로직 (정밀 매칭 적용)
+        [Neg Risk & Native USDC 대응] 자산 분할 후 즉시 매도 주문 실행 로직
         """
         try:
             logger.info("🚀 optimizer_start", market_id=market_id, amount=amount_usd)
-            session = await self.honeypot_service.get_session()
             
-            # 1. API 쿼리 파라미터 유연화
-            if market_id.startswith("0x"):
-                gamma_url = f"{self.honeypot_service.GAMMA_API}?conditionId={market_id}"
-            else:
-                gamma_url = f"{self.honeypot_service.GAMMA_API}?id={market_id}" 
-
-            async with session.get(gamma_url) as res:
-                if res.status == 200:
-                    data = await res.json()
-                    if isinstance(data, list) and len(data) > 0:
-                        # [핵심 수정] 대소문자 무관, 정확히 일치하는 후보만 탐색 (Fallback 제거)
-                        target_id_clean = market_id.lower().strip()
-                        m = None
-                        for item in data:
-                            cond_id = str(item.get("conditionId", "")).lower()
-                            num_id = str(item.get("id", "")).lower()
-                            if cond_id == target_id_clean or num_id == target_id_clean:
-                                m = item
-                                break
-                        
-                        if not m:
-                            logger.error("❌ 일치하는 후보를 찾지 못했습니다. (목록에 없음)", target=market_id)
-                            return False
-                        
-                        found_cond_id = m.get("conditionId")
-                        if found_cond_id:
-                            self.current_condition_id = found_cond_id
-                            logger.info("🎯 found_real_condition_id", condition_id=found_cond_id)
-                        
-                        # Token ID (YES/NO) 추출 (항상 API 최신 정보 우선)
-                        raw_ids = m.get("clobTokenIds", "[]")
-                        token_ids = json.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
-                        
-                        if len(token_ids) >= 2:
-                            yes_id, no_id = token_ids[0], token_ids[1]
-                            self.yes_token_id, self.no_token_id = yes_id, no_id
-                            logger.info("🎯 found_token_ids", yes=yes_id, no=no_id)
-                    else:
-                        logger.error("❌ API 응답이 비어있습니다.", url=gamma_url)
-                        return False
-
-            # 데이터 복구 검증
-            if not yes_id or not no_id or not self.current_condition_id:
-                logger.error("❌ 정보 복구 실패: API 데이터를 확인하세요.", market_id=market_id)
+            # 1. API 마켓 정보 조회 및 매칭
+            session = await self.honeypot_service.get_session()
+            url = f"{self.honeypot_service.GAMMA_API}?conditionId={market_id}" if market_id.startswith("0x") else f"{self.honeypot_service.GAMMA_API}?id={market_id}" 
+            async with session.get(url) as res:
+                data = await res.json()
+            
+            m = next((item for item in data if str(item.get("conditionId", "")).lower() == market_id.lower() or str(item.get("id", "")) == market_id), None)
+            if not m:
+                logger.error("❌ 마켓을 찾을 수 없습니다.")
                 return False
 
-            # 2. 가스리스 자산 분할 실행
-            split_success = await self.order_executor.split_assets(amount_usd, self.current_condition_id)
-            if not split_success:
-                logger.error("❌ optimizer_mint_failed")
+            # 2. 필수 데이터 추출 (담보 자산 주소 및 토큰 정보)
+            # API에서 준 collateralToken 주소를 사용해야 정확한 YES/NO 토큰이 생성됩니다.
+            collateral_token = m.get("collateralToken", "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359") 
+            raw_ids = m.get("clobTokenIds", "[]")
+            token_ids = json.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
+            num_outcomes = len(token_ids)
+            
+            # 3. 해당 담보 자산의 실제 잔고 확인 (Revert 방지)
+            # get_usdc_balance_raw가 담보 주소를 인자로 받도록 수정되어야 합니다.
+            requested_raw = int(amount_usd * 1e6)
+            balance_raw = await self.order_executor.get_usdc_balance_raw(collateral_token)
+            if balance_raw < requested_raw:
+                logger.error("❌ insufficient_balance", 
+                             token=collateral_token,
+                             available=balance_raw/1e6, 
+                             requested=amount_usd)
                 return False
 
-            # 3. 봇의 전역 타겟을 현재 마켓으로 즉시 고정
+            # 4. 타겟 적용 및 인벤토리 리셋
             await self._apply_market_target({
-                'market_id': str(m.get('id')), 
-                'condition_id': self.current_condition_id,
-                'yes_token_id': self.yes_token_id,
-                'no_token_id': self.no_token_id,
-                'min_size': m.get('min_size', 20.0),
-                'title': m.get('question', 'Manual Target')
-            }, use_lock=True)
+                'market_id': str(m.get('id')),
+                'condition_id': m.get('conditionId'),
+                'yes_token_id': token_ids[0],
+                'no_token_id': token_ids[1],
+                'num_outcomes': num_outcomes,
+                'min_size': float(m.get('min_size', 1.0)),
+                'title': m.get('question')
+            })
 
-            self.inventory_manager.update_inventory(amount_usd, amount_usd)
+            # 5. 가스리스 자산 분할(Split) 실행
+            # 정확한 담보 자산 주소를 전달하여 올바른 YES/NO 토큰 ID를 생성합니다.
+            split_success = await self.order_executor.split_assets(
+                amount_usd=amount_usd, 
+                condition_id=self.current_condition_id, 
+                collateral_token=collateral_token,
+                num_outcomes=num_outcomes
+            )
+            
+            if not split_success:
+                logger.error("❌ Split(Mint) 트랜잭션 실패")
+                return False
 
+            # 6. 인벤토리 기록 업데이트
+            self.inventory_manager.record_minting(amount_usd)
+            logger.info("📦 Inventory Updated after Split", 
+                        yes=self.inventory_manager.inventory.yes_position, 
+                        no=self.inventory_manager.inventory.no_position)
+
+            # 7. 즉시 매도 주문(Sell Order) 실행
+            logger.info("⚖️ Placing initial SELL orders for farming...")
             async with self.state_lock:
+                await asyncio.sleep(1) # 오더북 동기화 대기
                 await self.refresh_quotes()
             
-            logger.info("💰 Manual Farming Started & Target Locked", market=m.get("question"))
+            logger.info("💰 Optimizer Order & Initial Selling Complete", market=m.get("question"))
             return True
 
         except Exception as e:

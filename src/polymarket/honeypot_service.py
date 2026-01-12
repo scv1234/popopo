@@ -315,7 +315,7 @@ class HoneypotService:
         token_ids = json.loads(clob_token_ids) if isinstance(clob_token_ids, str) else clob_token_ids
 
         return {
-            "market_id": market.get("conditionId"),
+            "market_id": str(market.get("id")),
             "condition_id": market.get("conditionId"), # [추가] 자산 분할용 condition_id
             "title": market.get("question"),
             "score": round(final_score, 4),

@@ -48,6 +48,11 @@ class InventoryManager:
         self.max_exposure_shares = max_exposure_usd * 2.0 
         self.min_exposure_shares = min_exposure_usd * 2.0
 
+    def reset(self):
+        """새로운 마켓으로 전환 시 인벤토리 상태를 완전히 초기화합니다."""
+        self.inventory = Inventory()
+        logger.info("inventory_manager_reset_complete")
+
     def update_inventory(self, yes_delta: float, no_delta: float):
         self.inventory.update(yes_delta, no_delta)
         logger.debug(
