@@ -69,7 +69,7 @@ async def get_honey_pots():
 
 @app.get("/status")
 async def get_status():
-    """봇의 실시간 상태 반환 (안전한 가격 추출 적용)"""
+    """봇의 실시간 상태 및 포지션 반환"""
     mid_price = 0.5
     if bot.current_market_id:
         yes_book = bot.orderbooks.get(bot.yes_token_id, {})
@@ -77,12 +77,21 @@ async def get_status():
         asks = yes_book.get("asks", [])
         if bids and asks:
             try:
-                # 봇 내부에 정의된 안전 추출 함수 사용
                 mid_price = (bot._extract_price(bids[0]) + bot._extract_price(asks[0])) / 2.0
             except: pass
+
+    # InventoryManager에서 현재 포지션 수량을 가져옴
     return {
         "is_halted": bot.risk_manager.is_halted, 
-        "market": {"market_id": bot.current_market_id, "mid_price": round(mid_price, 4)}
+        "market": {
+            "market_id": bot.current_market_id, 
+            "mid_price": round(mid_price, 4)
+        },
+        "positions": {
+            "yes": round(bot.inventory_manager.inventory.yes_position, 2),
+            "no": round(bot.inventory_manager.inventory.no_position, 2),
+            "net_exposure": round(bot.inventory_manager.inventory.net_exposure_shares, 2)
+        }
     }
 
 @app.get("/wallet")
@@ -116,11 +125,12 @@ async def get_open_orders():
 
 @app.post("/place-semi-auto-order")
 async def place_order(req: SemiAutoOrderRequest):
-    """[수정] Split & Sell Farming 전략 실행"""
-    # 우리가 수정한 bot.execute_optimizer_order를 호출합니다.
-    success = await bot.execute_optimizer_order(req.market_id, req.amount, req.yes_token_id, req.no_token_id)
+    """지갑 잔고 기반 Sell Farming 전략 실행 (Split은 외부에서 수행)"""
+    # [수정] TypeError 해결: signature에 맞춰 market_id와 amount만 전달
+    success = await bot.execute_optimizer_order(req.market_id, req.amount)
+    
     if not success: 
-        raise HTTPException(status_code=500, detail="Split & Farm strategy failed")
+        raise HTTPException(status_code=500, detail="Farming strategy start failed. Check your token balances.")
     return {"status": "success"}
 
 @app.post("/cancel-order/{order_id}")

@@ -1,34 +1,24 @@
-from __future__ import annotations
+# src/inventory/inventory_manager.py
 
+from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
-
 import structlog
 
 logger = structlog.get_logger(__name__)
-
 
 @dataclass
 class Inventory:
     yes_position: float = 0.0
     no_position: float = 0.0
-    net_exposure_shares: float = 0.0  # USD 가치가 아닌 수량(Share) 차이로 변경
+    net_exposure_shares: float = 0.0
 
     def update(self, yes_delta: float, no_delta: float):
-        """
-        체결된 수량만큼 인벤토리를 업데이트합니다.
-        """
         self.yes_position += yes_delta
         self.no_position += no_delta
-        
-        # 수량 기반의 노출도 계산 (YES 수량 - NO 수량)
-        # 이 값이 0에 가까울수록 진정한 델타 뉴트럴 상태입니다.
         self.net_exposure_shares = self.yes_position - self.no_position
 
     def get_skew(self) -> float:
-        """
-        인벤토리 쏠림 현상(Skew)을 수량 기준으로 계산합니다.
-        """
         total_shares = abs(self.yes_position) + abs(self.no_position)
         if total_shares == 0:
             return 0.0
@@ -44,65 +34,50 @@ class InventoryManager:
         self.min_exposure_usd = min_exposure_usd
         self.target_balance = target_balance
         self.inventory = Inventory()
-
         self.max_exposure_shares = max_exposure_usd * 2.0 
         self.min_exposure_shares = min_exposure_usd * 2.0
 
     def reset(self):
-        """새로운 마켓으로 전환 시 인벤토리 상태를 완전히 초기화합니다."""
         self.inventory = Inventory()
         logger.info("inventory_manager_reset_complete")
 
     def update_inventory(self, yes_delta: float, no_delta: float):
         self.inventory.update(yes_delta, no_delta)
-        logger.debug(
-            "inventory_updated_by_shares",
-            yes_position=self.inventory.yes_position,
-            no_position=self.inventory.no_position,
-            net_exposure_shares=self.inventory.net_exposure_shares,
-            skew=self.inventory.get_skew(),
-        )
 
+    # [수정] 외부(웹사이트)에서 수행된 Split 결과 잔고를 동기화하는 기능 추가
+    def sync_inventory(self, yes_balance: float, no_balance: float):
+        """온체인에서 감지된 토큰 잔고를 봇의 내부 상태에 동기화합니다."""
+        self.inventory.yes_position = yes_balance
+        self.inventory.no_position = no_balance
+        self.inventory.net_exposure_shares = yes_balance - no_balance
+        
+        logger.info("🔄 Inventory Synced from On-chain Balance", 
+                    yes=self.inventory.yes_position, 
+                    no=self.inventory.no_position)
+
+    # 기존 record_minting은 sync_inventory로 대체 가능하므로 유지하거나 삭제 가능
     def record_minting(self, amount_shares: float):
-        """
-        민팅(Split) 완료 후 Yes와 No의 수량을 동시에 업데이트합니다.
-        이때 net_exposure_shares는 0(중립)이 유지되어야 합니다.
-        """
         self.inventory.yes_position += amount_shares
         self.inventory.no_position += amount_shares
-        
-        # 1:1 상태이므로 노출도는 변하지 않음 (Yes 수량 - No 수량)
         self.inventory.net_exposure_shares = self.inventory.yes_position - self.inventory.no_position
-        
-        logger.info("Inventory Synced after Minting", 
-                    yes=self.inventory.yes_position, 
-                    no=self.inventory.no_position,
-                    exposure=self.inventory.net_exposure_shares)
 
     def can_quote_yes(self, size_shares: float) -> bool:
-        """새로운 YES 주문을 넣었을 때 수량 한도를 넘지 않는지 확인합니다."""
         potential_exposure = self.inventory.net_exposure_shares + size_shares
         return potential_exposure <= self.max_exposure_shares
 
     def can_quote_no(self, size_shares: float) -> bool:
-        """새로운 NO 주문을 넣었을 때 수량 한도를 넘지 않는지 확인합니다."""
         potential_exposure = self.inventory.net_exposure_shares - size_shares
         return potential_exposure >= self.min_exposure_shares
 
     def get_quote_size_yes(self, base_size_shares: float) -> float:
-        """인벤토리 균형을 위해 YES 주문 수량을 조절합니다."""
-        # 이미 YES가 NO보다 많다면 주문 크기를 줄임
         if self.inventory.net_exposure_shares > self.target_balance:
             return base_size_shares * 0.5
         return base_size_shares
 
     def get_quote_size_no(self, base_size_shares: float) -> float:
-        """인벤토리 균형을 위해 NO 주문 수량을 조절합니다."""
-        # 이미 NO가 YES보다 많다면 주문 크기를 줄임
         if self.inventory.net_exposure_shares < self.target_balance:
             return base_size_shares * 0.5
         return base_size_shares
 
     def should_rebalance(self, skew_limit: float = 0.3) -> bool:
-
         return not self.inventory.is_balanced(skew_limit)

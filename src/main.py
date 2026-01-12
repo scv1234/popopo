@@ -74,6 +74,27 @@ class MarketMakerBot:
     # 1. Lifecycle & Bootstrap (봇의 시작과 종료)
     # =========================================================================
 
+    async def sync_positions_from_chain(self):
+        """온체인 잔고를 가져와 인벤토리에 강제 동기화합니다."""
+        if not self.yes_token_id or not self.no_token_id:
+            return
+        
+        # OrderExecutor를 통해 실제 잔고 조회
+        yes_bal = await self.order_executor.get_token_balance(self.yes_token_id)
+        no_bal = await self.order_executor.get_token_balance(self.no_token_id)
+        
+        # 인벤토리 매니저에 저장
+        self.inventory_manager.sync_inventory(yes_bal, no_bal)
+
+    async def run_position_sync_loop(self):
+        """지갑 잔고를 주기적으로 감지하여 인벤토리를 최신화합니다."""
+        while self.running:
+            try:
+                await self.sync_positions_from_chain()
+            except Exception as e:
+                logger.error("position_sync_loop_error", error=str(e))
+            await asyncio.sleep(10) # 10초마다 지갑 확인
+    
     async def run(self):
         logger.info("bot_starting")
     
@@ -81,35 +102,35 @@ class MarketMakerBot:
         await self.order_executor.initialize()
         self.running = True
 
-        # 2. 초기 마켓 탐색 (초기 1회는 Lock 없이 동기적으로 설정)
-        candidates = await self.honeypot_service.scan()
+        # 2. 초기 마켓 탐색: DB 데이터 로드
+        logger.info("loading_initial_market_from_db")
+        candidates = await self.honeypot_service.get_cached_candidates() #
+        
         if candidates:
-            # use_lock=False: 봇 시작 전이므로 락 불필요
             await self._apply_market_target(candidates[0], use_lock=False)
+            # [추가] 시작 직후 잔고 즉시 동기화
+            await self.sync_positions_from_chain()
         else:
-            logger.warning("no_initial_honeypot_found_waiting_for_loop")
+            logger.warning("no_db_records_found_waiting_for_first_scan")
 
         # 3. 핸들러 등록 및 웹소켓 연결
         self.ws_client.register_handler("l2_book", self._handle_orderbook_update)
         self.ws_client.register_handler("user", self._handle_trade_update)
-    
         await self.ws_client.connect()
-        
-        # 유저 전용 채널 구독 (체결 확인용)
         await self.ws_client.subscribe_user(self.order_executor.safe_address)
         
-        # 마켓이 설정되었다면 오더북 구독
         if self.current_market_id:
             if self.yes_token_id: await self.ws_client.subscribe_orderbook(self.yes_token_id)
             if self.no_token_id: await self.ws_client.subscribe_orderbook(self.no_token_id)
             await self.update_orderbook()
 
-        # 4. 병렬 루프 실행 (핵심 태스크 분리)
+        # 4. 병렬 루프 실행
         tasks = [
-            asyncio.create_task(self.run_market_discovery_loop()), # 마켓 탐색
-            asyncio.create_task(self.run_cancel_replace_cycle()),  # 주문 집행
-            asyncio.create_task(self.run_auto_redeem()),           # 수익 실현
-            asyncio.create_task(self.ws_client.listen())           # 소켓 수신
+            asyncio.create_task(self.run_market_discovery_loop()),
+            asyncio.create_task(self.run_position_sync_loop()),    # [수정] 포지션 동기화 루프 추가
+            asyncio.create_task(self.run_cancel_replace_cycle()),  
+            asyncio.create_task(self.run_auto_redeem()),           
+            asyncio.create_task(self.ws_client.listen())           
         ]
     
         try:
@@ -195,12 +216,9 @@ class MarketMakerBot:
             await asyncio.sleep(600)
 
     async def _apply_market_target(self, market_data: dict[str, Any], use_lock: bool = True):
-        """
-        새로운 마켓 정보를 적용합니다.
-        use_lock=True일 경우, 쿼트 루프가 접근하지 못하도록 Lock을 겁니다.
-        """
+        """새로운 마켓 정보를 적용합니다."""
         async def _critical_section():
-            # 1. 이전 마켓 정리
+            # 1. 이전 마켓 정리 (기존 코드 유지)
             old_market_id = self.current_market_id
             if old_market_id:
                 await self.order_executor.cancel_all_orders(old_market_id)
@@ -208,40 +226,39 @@ class MarketMakerBot:
 
             self.inventory_manager.reset()
 
-            # 2. 로컬 상태 변수 업데이트
+            # 2. 로컬 상태 변수 업데이트 (기존 코드 유지)
             self.current_market_id = str(market_data['market_id'])
-            self.current_condition_id = market_data.get('condition_id', "") # [추가]
+            self.current_condition_id = market_data.get('condition_id', "") 
             self.current_num_outcomes = market_data.get('num_outcomes', 2)
             self.yes_token_id = market_data['yes_token_id']
             self.no_token_id = market_data['no_token_id']
-            self.min_size = market_data.get('min_size', 1.0) # 기본값 설정
+            self.min_size = market_data.get('min_size', 1.0)
             
             logger.info("🎯 market_target_updated", 
                         title=market_data.get('title'), 
                         market_id=self.current_market_id)
         
-            # 상태 초기화
             self.orderbooks = {}
             self.last_quote_time = 0.0
             self.risk_manager.is_halted = False 
             self.current_tick_size = 0.01
 
-            # 3. 새로운 마켓 구독 및 데이터 동기화
+            # 3. 새로운 마켓 구독 및 데이터 동기화 (기존 코드 유지)
             if self.ws_client.running:
                 if self.yes_token_id: await self.ws_client.subscribe_orderbook(self.yes_token_id)
                 if self.no_token_id: await self.ws_client.subscribe_orderbook(self.no_token_id)
                 await self.update_orderbook()
 
-            # [핵심] 해당 마켓의 틱 사이즈 정보를 동적으로 가져옴
             try:
-                # SDK의 get_tick_size는 문자열(예: "0.01")을 직접 반환합니다.
                 tick_size_str = self.order_executor.client.get_tick_size(self.yes_token_id)
                 self.current_tick_size = float(tick_size_str)
                 logger.info("✅ Market Tick Size Updated", tick=self.current_tick_size)
             except Exception as e:
-                # 오타('token_info')가 나지 않도록 직접 tick_size_str 사용
                 logger.warning(f"⚠️ Failed to fetch tick size ({e}), using default 0.01")
                 self.current_tick_size = 0.01 
+
+            # [핵심 수정] 마켓 설정이 완료된 직후 즉시 지갑 잔고를 확인하여 인벤토리에 반영
+            await self.sync_positions_from_chain()
 
         if use_lock:
             async with self.state_lock:
@@ -580,82 +597,51 @@ class MarketMakerBot:
             await asyncio.sleep(300)
 
     async def execute_optimizer_order(self, market_id: str, amount_usd: float) -> bool:
-        """
-        [Neg Risk & Native USDC 대응] 자산 분할 후 즉시 매도 주문 실행 로직
-        """
+        """직접 Split 하지 않고, 지갑의 YES/NO 잔고를 감지하여 매도 전략을 실행합니다."""
         try:
-            logger.info("🚀 optimizer_start", market_id=market_id, amount=amount_usd)
+            logger.info("🚀 포지션 감지 및 매도 시작", market_id=market_id)
             
-            # 1. API 마켓 정보 조회 및 매칭
+            # 1. 마켓 정보 조회 및 타겟 설정
             session = await self.honeypot_service.get_session()
             url = f"{self.honeypot_service.GAMMA_API}?conditionId={market_id}" if market_id.startswith("0x") else f"{self.honeypot_service.GAMMA_API}?id={market_id}" 
             async with session.get(url) as res:
                 data = await res.json()
             
             m = next((item for item in data if str(item.get("conditionId", "")).lower() == market_id.lower() or str(item.get("id", "")) == market_id), None)
-            if not m:
-                logger.error("❌ 마켓을 찾을 수 없습니다.")
-                return False
+            if not m: return False
 
-            # 2. 필수 데이터 추출 (담보 자산 주소 및 토큰 정보)
-            # API에서 준 collateralToken 주소를 사용해야 정확한 YES/NO 토큰이 생성됩니다.
-            collateral_token = m.get("collateralToken", "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359") 
             raw_ids = m.get("clobTokenIds", "[]")
             token_ids = json.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
-            num_outcomes = len(token_ids)
             
-            # 3. 해당 담보 자산의 실제 잔고 확인 (Revert 방지)
-            # get_usdc_balance_raw가 담보 주소를 인자로 받도록 수정되어야 합니다.
-            requested_raw = int(amount_usd * 1e6)
-            balance_raw = await self.order_executor.get_usdc_balance_raw(collateral_token)
-            if balance_raw < requested_raw:
-                logger.error("❌ insufficient_balance", 
-                             token=collateral_token,
-                             available=balance_raw/1e6, 
-                             requested=amount_usd)
-                return False
-
-            # 4. 타겟 적용 및 인벤토리 리셋
             await self._apply_market_target({
                 'market_id': str(m.get('id')),
                 'condition_id': m.get('conditionId'),
                 'yes_token_id': token_ids[0],
                 'no_token_id': token_ids[1],
-                'num_outcomes': num_outcomes,
+                'num_outcomes': len(token_ids),
                 'min_size': float(m.get('min_size', 1.0)),
                 'title': m.get('question')
             })
 
-            # 5. 가스리스 자산 분할(Split) 실행
-            # 정확한 담보 자산 주소를 전달하여 올바른 YES/NO 토큰 ID를 생성합니다.
-            split_success = await self.order_executor.split_assets(
-                amount_usd=amount_usd, 
-                condition_id=self.current_condition_id, 
-                collateral_token=collateral_token,
-                num_outcomes=num_outcomes
-            )
-            
-            if not split_success:
-                logger.error("❌ Split(Mint) 트랜잭션 실패")
+            # 2. [중요] 지갑의 실제 잔고 확인 (Sync)
+            yes_bal = await self.order_executor.get_token_balance(self.yes_token_id)
+            no_bal = await self.order_executor.get_token_balance(self.no_token_id)
+
+            if yes_bal <= 0 and no_bal <= 0:
+                logger.warning("⚠️ 감지된 잔고가 없습니다. 웹에서 Split을 먼저 하셨나요?")
                 return False
 
-            # 6. 인벤토리 기록 업데이트
-            self.inventory_manager.record_minting(amount_usd)
-            logger.info("📦 Inventory Updated after Split", 
-                        yes=self.inventory_manager.inventory.yes_position, 
-                        no=self.inventory_manager.inventory.no_position)
+            # 3. 인벤토리에 동기화하여 화면에 표시되게 함
+            self.inventory_manager.sync_inventory(yes_bal, no_bal)
 
-            # 7. 즉시 매도 주문(Sell Order) 실행
-            logger.info("⚖️ Placing initial SELL orders for farming...")
+            # 4. 즉시 매도 쿼트 생성
             async with self.state_lock:
-                await asyncio.sleep(1) # 오더북 동기화 대기
+                await asyncio.sleep(1) # 오더북 대기
                 await self.refresh_quotes()
             
-            logger.info("💰 Optimizer Order & Initial Selling Complete", market=m.get("question"))
             return True
-
         except Exception as e:
-            logger.error("❌ optimizer_order_exception", error=str(e))
+            logger.error("❌ 실행 오류", error=str(e))
             return False
 
     def _extract_best(self, book):

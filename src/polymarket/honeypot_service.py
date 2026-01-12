@@ -100,6 +100,29 @@ class HoneypotService:
         except Exception as e:
             print(f"❌ DB 저장 중 오류 발생: {e}")    
 
+    async def get_cached_candidates(self) -> list[dict[str, Any]]:
+        """DB에 저장된 기존 꿀통 마켓 목록을 로드합니다."""
+        try:
+            # DB 연결 및 테이블 존재 여부 확인
+            conn = sqlite3.connect('bot_data.db')
+            cursor = conn.cursor()
+            
+            # 테이블이 없는 경우 빈 리스트 반환
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='honeypots'")
+            if not cursor.fetchone():
+                conn.close()
+                return []
+                
+            # 최신 업데이트 순으로 데이터 조회
+            cursor.execute('SELECT data FROM honeypots ORDER BY updated_at DESC')
+            rows = cursor.fetchall()
+            conn.close()
+            
+            return [json.loads(row[0]) for row in rows]
+        except Exception as e:
+            logger.error(f"❌ 캐시된 마켓 로드 중 오류 발생: {e}")
+            return []
+
     async def get_market_data_complete(self, session, market, semaphore):
         """
         [핵심 최적화] 리워드를 먼저 조회하고, 보상이 기준($10) 미달이면 

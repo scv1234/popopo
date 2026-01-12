@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional, List
 import structlog
 from web3 import Web3
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.clob_types import OrderArgs, OrderType, BalanceAllowanceParams, AssetType # BalanceAllowanceParams, AssetType 추가
 # 가스리스 실행을 위한 라이브러리 추가
 from py_builder_relayer_client.client import RelayClient
 # SafeTransaction 클래스 임포트 추가
@@ -189,15 +189,29 @@ class OrderExecutor:
             logger.error("❌ Order Placement Failed", error=str(e))
             return None
 
-    async def get_usdc_balance_raw(self, token_address: str = None) -> int:
-        """지정된 토큰의 원본 잔고(Raw unit)를 가져옵니다."""
+    async def get_token_balance(self, token_id: str) -> float:
+        """지정된 토큰 ID의 현재 지갑 잔고를 조회합니다."""
         try:
-            target_token = Web3.to_checksum_address(token_address or USDC_ADDRESS)
-            contract = self.w3.eth.contract(address=target_token, abi=ERC20_ABI)
-            return contract.functions.balanceOf(self.safe_address).call()
+            # [수정] SDK 버전에 맞는 get_balance_allowance 메서드 사용
+            params = BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL,
+                token_id=token_id
+            )
+            # 해당 메서드는 동기 함수일 가능성이 높으므로 루프 차단을 방지하기 위해 thread에서 실행하거나 직접 호출합니다.
+            balance_info = self.client.get_balance_allowance(params)
+            return float(balance_info.get("balance", 0))
         except Exception as e:
-            logger.error("❌ Balance Fetch Error", error=str(e))
-            return 0
+            logger.error("❌ Token Balance Fetch Error", token_id=token_id, error=str(e))
+            return 0.0
+
+    # USDC 잔고 조회도 동일하게 수정 가능 (선택 사항)
+    async def get_usdc_balance(self) -> float:
+        try:
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            balance_info = self.client.get_balance_allowance(params)
+            return float(balance_info.get("balance", 0))
+        except:
+            return 0.0
 
     async def cancel_order(self, order_id: str) -> bool:
         try:

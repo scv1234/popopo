@@ -75,6 +75,11 @@
 
         ::-webkit-scrollbar { width: 4px; }
         ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+        /* 포지션 요약 박스 */
+        .pos-card { display: flex; flex-direction: column; align-items: center; justify-content: center; background: #0d1117; padding: 8px; border-radius: 4px; border: 1px solid var(--border); flex: 1; }
+        .pos-label { font-size: 9px; color: var(--text-muted); text-transform: uppercase; margin-bottom: 2px; }
+        .pos-value { font-size: 16px; font-weight: bold; }
     </style>
 </head>
 <body>
@@ -109,7 +114,7 @@
     </div>
 
     <div class="column">
-        <div class="panel" style="flex: 0.5;">
+        <div class="panel" style="flex: 0.4;">
             <div class="panel-header"><h2>⚖️ Optimizer</h2></div>
             <div style="display:flex; gap:6px; margin-bottom: 8px;">
                 <input type="number" id="opt-budget" value="1000" style="margin:0;">
@@ -119,7 +124,26 @@
                 <div style="text-align:center; padding-top:20px; color:var(--text-muted);">Ready to analyze.</div>
             </div>
         </div>
-        <div class="panel" style="flex: 0.5;">
+
+        <div class="panel" style="flex: 0.2;">
+            <div class="panel-header"><h2>📊 Current Positions</h2></div>
+            <div style="display: flex; gap: 8px; justify-content: space-between;">
+                <div class="pos-card">
+                    <span class="pos-label">YES Shares</span>
+                    <span id="pos-yes" class="pos-value" style="color: var(--accent);">0.00</span>
+                </div>
+                <div class="pos-card">
+                    <span class="pos-label">NO Shares</span>
+                    <span id="pos-no" class="pos-value" style="color: var(--red);">0.00</span>
+                </div>
+                <div class="pos-card">
+                    <span class="pos-label">Exposure</span>
+                    <span id="pos-exposure" class="pos-value" style="color: var(--blue);">0.00</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel" style="flex: 0.4;">
             <div class="panel-header">
                 <h2 class="active-orders-title">ACTIVE ORDERS</h2>
                 <button onclick="batchCancelManual()" style="width:auto; padding: 2px 8px; font-size:10px; background:var(--red); border-radius:4px;">Cancel All</button>
@@ -235,7 +259,7 @@
                 await fetch(`${API_URL}/place-semi-auto-order`, { 
                     method: 'POST', 
                     headers: {'Content-Type': 'application/json'}, 
-                    body: JSON.stringify({ market_id: id, amount: amt, yes_token_id: m.yes_token_id, no_token_id: m.no_token_id }) 
+                    body: JSON.stringify({ market_id: id, amount: amt }) 
                 });
             } catch (e) { console.error(`Order failed for ${id}`, e); }
         }
@@ -247,6 +271,18 @@
 
     async function updateWallet() {
         try { const res = await fetch(`${API_URL}/wallet`); const data = await res.json(); document.getElementById('wallet-usdc').textContent = `$${Math.floor(data.usdc_balance).toLocaleString()}`; } catch (e) {}
+    }
+
+    async function updateStatus() {
+        try {
+            const res = await fetch(`${API_URL}/status`);
+            const data = await res.json();
+            if (data.positions) {
+                document.getElementById('pos-yes').textContent = data.positions.yes.toFixed(2);
+                document.getElementById('pos-no').textContent = data.positions.no.toFixed(2);
+                document.getElementById('pos-exposure').textContent = data.positions.net_exposure.toFixed(2);
+            }
+        } catch (e) { console.error("Status update failed:", e); }
     }
 
     async function updateMarkets() {
@@ -318,7 +354,7 @@
     async function updateLogs() { 
         try { 
             const res = await fetch(`${API_URL}/logs`); const logs = await res.json(); const logDiv = document.getElementById('logs'); 
-            const orderKeywords = ['order', 'place', 'cancel', 'executed', 'trade', 'manual', 'defending'];
+            const orderKeywords = ['order', 'place', 'cancel', 'executed', 'trade', 'manual', 'defending', 'inventory', 'synced'];
             const filteredLogs = logs.filter(log => { const lowerLog = log.toLowerCase(); return orderKeywords.some(key => lowerLog.includes(key)); });
             logDiv.innerHTML = filteredLogs.map(l => `<div>${l}</div>`).join(''); logDiv.scrollTop = logDiv.scrollHeight; 
         } catch(e){} 
@@ -341,7 +377,7 @@
             showToast("Placing manual order...", "info");
             const res = await fetch(`${API_URL}/place-semi-auto-order`, { 
                 method: 'POST', headers: {'Content-Type': 'application/json'}, 
-                body: JSON.stringify({ market_id: id, amount: amt, yes_token_id: m.yes_token_id, no_token_id: m.no_token_id }) 
+                body: JSON.stringify({ market_id: id, amount: amt }) 
             });
             if(res.ok) { showToast(`주문 성공!`, "success"); } else { showToast(`주문 실패`, "error"); }
         } catch (e) { showToast("Connection error", "error"); }
@@ -350,13 +386,14 @@
 
     // 통합 갱신 엔진 (주기 최적화)
     setInterval(updateWallet, 5000); 
-    setInterval(updateMarkets, 1500); 
+    setInterval(updateMarkets, 2000); 
     setInterval(updateOrders, 2000); 
     setInterval(updateLogs, 3000);
+    setInterval(updateStatus, 1000); // 포지션 정보는 1초마다 갱신
 
     // 초기 로드
     window.addEventListener('load', () => {
-        updateMarkets(); updateWallet(); updateOrders(); updateLogs();
+        updateMarkets(); updateWallet(); updateOrders(); updateLogs(); updateStatus();
     });
 </script>
 </body>
