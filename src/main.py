@@ -253,51 +253,69 @@ class MarketMakerBot:
     # =========================================================================
 
     async def _handle_orderbook_update(self, data: dict[str, Any]):
-        """웹소켓 오더북 업데이트 핸들러"""
+        """안전한 가격 추출 방식을 적용하여 KeyError 방지"""
         asset_id = data.get("asset_id") or data.get("token_id")
-    
-        # 데이터가 'book' 키 안에 들어있는지, 아니면 루트에 있는지 확인
         book_data = data.get("book") if data.get("book") else data
     
         if asset_id and "bids" in book_data:
-            # Bids는 내림차순(높은 가격부터), Asks는 오름차순(낮은 가격부터) 정렬
             self.orderbooks[asset_id] = {
                 "bids": self._sort_book(book_data.get("bids", []), reverse=True),
                 "asks": self._sort_book(book_data.get("asks", []))
             }
-            # [추가] 가격 급락 시 비상 정지 체크
-            if asset_id in [self.yes_token_id, self.no_token_id]:
-                # [수정] 인덱스 직접 접근 대신 안전한 추출 함수 사용
+            
+            # [수정] 인덱스 [0][0] 직접 접근 대신 안전한 함수 사용
+            if self.orderbooks[asset_id]["bids"]:
                 best_bid = self._extract_price(self.orderbooks[asset_id]["bids"][0])
                 self.risk_manager.check_market_danger(best_bid)
             
             asyncio.create_task(self.check_and_defend_orders())
 
     async def _handle_trade_update(self, data: dict[str, Any]):
-        """내 주문 체결 정보 수신"""
+        """내 주문 체결 정보 수신 및 전략 상태 업데이트"""
         order_id = data.get("order_id")
         actual_price = float(data.get("price", 0))
         size = float(data.get("size", 0))
         token_id = data.get("token_id")
-        side = data.get("side")
+        side = data.get("side") # "BUY" 또는 "SELL"
 
-        # [핵심] 매도(SELL) 체결 시 원금 회수 마지노선 설정
-        if side == "SELL":
-            token_type = "YES" if token_id == self.yes_token_id else "NO"
-            # 변수명 수정: price -> actual_price
-            self.risk_manager.set_recovery_target(actual_price)
-            self.quote_engine.update_last_sold_price(token_type, actual_price)
-            logger.info("TRADE_CONSUMED_SETTING_RECOVERY", type=token_type, price=actual_price)
+        if not token_id or size <= 0:
+            return
+
+        # 1. 인벤토리 수량 업데이트 (SELL이면 감소, BUY면 증가)
+        # 분할 후 매도 전략에서는 주로 SELL 체결이 발생합니다.
+        is_yes = (token_id == self.yes_token_id)
+        is_no = (token_id == self.no_token_id)
         
-        # 인벤토리 수량 업데이트
-        yes_delta = -size if token_id == self.yes_token_id and side == "SELL" else 0
-        no_delta = -size if token_id == self.no_token_id and side == "SELL" else 0
+        # 체결 방향에 따른 수량 변화 계산
+        multiplier = 1 if side == "BUY" else -1
+        yes_delta = size * multiplier if is_yes else 0
+        no_delta = size * multiplier if is_no else 0
+        
         self.inventory_manager.update_inventory(yes_delta, no_delta)
 
-        # 관리 목록 정리 (헤징/디펜드 호출 삭제)
+        # 2. 매도(SELL) 체결 시 'Leg Risk' 방어 데이터 기록
+        # 한쪽이 팔리는 순간, 남은 반대쪽은 반드시 (1.0 - 팔린가격) 이상으로 팔아야 원금이 보존됩니다.
+        if side == "SELL":
+            token_type = "YES" if is_yes else "NO"
+            
+            # RiskManager에게 한쪽이 팔렸음을 알리고 복구 목표가 설정
+            self.risk_manager.set_recovery_target(actual_price)
+            
+            # QuoteEngine에게 판매가를 전달하여 남은 쪽의 매도 마지노선을 계산하게 함
+            self.quote_engine.update_last_sold_price(token_type, actual_price)
+            
+            logger.info("TRADE_EXECUTED_LEG_SOLD", 
+                        token=token_type, 
+                        price=actual_price, 
+                        recovery_min=round(1.0 - actual_price, 4))
+
+        # 3. 관리 목록 정리
         if order_id:
             self.manual_order_ids.discard(order_id)
             self.open_orders.pop(order_id, None)
+            
+        # 4. 체결 후 즉시 방어 로직 가동 (남은 주문의 가격이 적절한지 체크)
+        asyncio.create_task(self.check_and_defend_orders())
 
     # =========================================================================
     # 4. Defense Logic (방어 및 리스크 관리)
@@ -540,87 +558,73 @@ class MarketMakerBot:
 
     async def execute_optimizer_order(self, market_id: str, amount_usd: float, yes_id: str = None, no_id: str = None) -> bool:
         """
-        시장별 옵티마이저 배분 금액에 따른 자동 주문 실행 로직.
-        데이터가 없을 경우 DB 캐시 및 Gamma API를 통해 복구하며 정밀하게 주문을 실행합니다.
+        [전략 변경: Split & Sell Farming]
+        1. USDC를 YES/NO 토큰으로 분할(Mint)합니다.
+        2. 분할된 수량만큼 리워드 범위 내에 매도(SELL) 주문을 배치하여 파밍을 시작합니다.
         """
         try:
-            logger.info("executing_optimizer_order_start", market=market_id, total_budget=amount_usd)
+            logger.info("optimizer_split_and_farm_start", market=market_id, amount=amount_usd)
             
-            # 1. HoneypotService의 세션 획득
+            # 1. 자산 분할에 필요한 정보(condition_id, token_ids) 확보
             session = await self.honeypot_service.get_session()
-
-            # 2. 토큰 ID 복구 (ID가 없는 경우 Gamma API에서 clobTokenIds 조회)
-            if not yes_id or not no_id:
+            
+            # 2. 토큰 ID 복구 (ID가 없는 경우 Gamma API에서 조회)
+            if not yes_id or not no_id or not self.current_condition_id:
                 logger.info("recovering_token_ids_for_optimizer", market=market_id)
-                gamma_url = f"{self.honeypot_service.GAMMA_API}?id={market_id}"
+                # [수정] ?id= 대신 ?condition_id= 를 사용해야 합니다.
+                gamma_url = f"{self.honeypot_service.GAMMA_API}?condition_id={market_id}"
+                
                 async with session.get(gamma_url) as res:
                     if res.status == 200:
                         data = await res.json()
                         if isinstance(data, list) and len(data) > 0:
                             m = data[0]
+                            # conditionId 강제 동기화
+                            if m.get("conditionId"):
+                                self.current_condition_id = m.get("conditionId")
+                            
                             raw_ids = m.get("clobTokenIds", "[]")
                             token_ids = json.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
                             if len(token_ids) >= 2:
                                 yes_id, no_id = token_ids[0], token_ids[1]
 
-            if not yes_id or not no_id:
-                logger.error("optimizer_token_id_recovery_failed", market=market_id)
+            # 상세 에러 로깅 추가 (무엇이 누락되었는지 확인용)
+            if not yes_id or not no_id or not self.current_condition_id:
+                logger.error("optimizer_info_recovery_failed", 
+                             yes=yes_id, no=no_id, cond=self.current_condition_id)
                 return False
 
-            # 3. 오더북 데이터 확보 (병렬 API 호출을 통한 최신 호가 파악)
+            # 2. [핵심 단계] 온체인 자산 분할(Split) 실행
+            # 지갑의 USDC를 1:1 비율의 YES/NO 토큰으로 쪼갭니다.
+            split_success = await self.order_executor.split_assets(amount_usd, self.current_condition_id)
+            if not split_success:
+                logger.error("optimizer_minting_failed")
+                return False
+
+            # 3. 인벤토리 수동 업데이트 (분할된 수량만큼 재고가 생겼음을 알림)
+            # Split 결과로 YES와 NO를 각각 amount_usd 수량만큼 보유하게 됩니다.
+            self.inventory_manager.update_inventory(amount_usd, amount_usd)
+            logger.info("optimizer_minting_success", amount=amount_usd)
+
+            # 4. 최신 호가 및 틱 사이즈 동기화
             tasks = [
                 self.honeypot_service.get_orderbook(session, yes_id),
                 self.honeypot_service.get_orderbook(session, no_id)
             ]
             responses = await asyncio.gather(*tasks, return_exceptions=True)
-            
             yes_book = responses[0] if not isinstance(responses[0], Exception) else {}
             no_book = responses[1] if not isinstance(responses[1], Exception) else {}
 
-            # 4. 데이터 부재 시 DB 캐시 활용 (백업 로직)
-            if not yes_book or not no_book:
-                logger.info("falling_back_to_db_cache_for_optimizer", market=market_id)
-                try:
-                    conn = sqlite3.connect('bot_data.db')
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT data FROM honeypots WHERE id = ?", (market_id,))
-                    row = cursor.fetchone()
-                    conn.close()
-                    if row:
-                        cached = json.loads(row[0])
-                        m_y, m_n = cached.get('mid_yes', 0.5), cached.get('mid_no', 0.5)
-                        if not yes_book: yes_book = {"bids": [[m_y - 0.001, 10]], "asks": [[m_y + 0.001, 10]]}
-                        if not no_book: no_book = {"bids": [[m_n - 0.001, 10]], "asks": [[m_n + 0.001, 10]]}
-                except Exception as e:
-                    logger.error("db_fallback_failed", error=str(e))
-
-            if not yes_book or not no_book:
-                logger.error("optimizer_order_aborted_insufficient_data")
-                return False
-
-            # 5. 최우선 호가 추출 (인덱스 에러 방지 포함)
-            def extract_best(book):
-                bids = book.get("bids", [])
-                asks = book.get("asks", [])
-                # [price, size] 리스트 형태 대응 (기존 extract_price 활용 가능)
-                bb = self._extract_price(bids[0]) if bids else 0.49
-                ba = self._extract_price(asks[0]) if asks else 0.51
-                return bb, ba
-
-            y_bb, y_ba = extract_best(yes_book)
-            n_bb, n_ba = extract_best(no_book)
-
-            # 6. 정밀 틱 사이즈 확인
+            y_bb, y_ba = self._extract_best(yes_book)
+            n_bb, n_ba = self._extract_best(no_book)
+            
             tick_size = self.current_tick_size
             try:
-                ts_str = self.order_executor.client.get_tick_size(yes_id)
-                tick_size = float(ts_str)
+                tick_size = float(self.order_executor.client.get_tick_size(yes_id))
             except: pass
 
-            # 7. 호가 생성 (QuoteEngine을 통한 리워드 최적 가격 산출)
-            # 예산을 절반으로 나누어 YES/NO에 각각 배분 (amount_usd 적용)
-            self.inventory_manager.target_inventory_balance = amount_usd / 2.0 
-            
+            # 5. [파밍 시작] 매도(SELL) 주문 생성
+            # QuoteEngine.generate_quotes는 이제 재고가 있으므로 SELL 주문을 생성합니다.
             yes_quote, no_quote = self.quote_engine.generate_quotes(
                 market_id=market_id,
                 yes_best_bid=y_bb, yes_best_ask=y_ba,
@@ -629,25 +633,19 @@ class MarketMakerBot:
                 tick_size=tick_size
             )
 
-            # 8. 주문 전송 (is_manual=True로 설정하여 봇의 자동 취소 루프에서 보호)
+            # 6. 매도 주문 전송
             order_tasks = []
-            if yes_quote: 
+            if yes_quote:
                 order_tasks.append(self._place_quote(yes_quote, "YES", is_manual=True))
-            if no_quote: 
+            if no_quote:
                 order_tasks.append(self._place_quote(no_quote, "NO", is_manual=True))
 
-            if not order_tasks:
-                logger.warning("optimizer_no_valid_quotes")
-                return False
-
-            results = await asyncio.gather(*order_tasks)
-            success = any(results)
-
-            if success:
-                logger.info("optimizer_order_placed_successfully", market=market_id)
-                # 실시간 감시를 위한 소켓 구독
+            if order_tasks:
+                await asyncio.gather(*order_tasks)
+                # 실시간 감시를 위한 구독
                 await self.ws_client.subscribe_orderbook(yes_id)
                 await self.ws_client.subscribe_orderbook(no_id)
+                logger.info("optimizer_farming_started")
                 return True
 
             return False
@@ -655,6 +653,14 @@ class MarketMakerBot:
         except Exception as e:
             logger.error("optimizer_order_exception", error=str(e))
             return False
+
+    def _extract_best(self, book):
+        """호가 데이터에서 최우선 호가를 안전하게 추출"""
+        bids = book.get("bids", [])
+        asks = book.get("asks", [])
+        bb = self._extract_price(bids[0]) if bids else 0.49
+        ba = self._extract_price(asks[0]) if asks else 0.51
+        return bb, ba
 
     async def cancel_single_order(self, order_id: str) -> bool:
         """특정 ID의 주문을 취소하고 관리 목록에서 제거합니다."""

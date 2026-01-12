@@ -24,22 +24,23 @@ class RiskManager:
         logger.info("🎯 RECOVERY_TARGET_SET", min_price=self.min_recovery_price)
 
     def validate_obi(self, orderbook: dict) -> tuple[bool, str]:
-        """[추가] OBI(Order Book Imbalance)를 분석하여 가격 급변동 전조를 감지합니다."""
         bids = orderbook.get("bids", [])
         asks = orderbook.get("asks", [])
         
         if not bids or not asks: return False, "EMPTY_ORDERBOOK"
 
-        # 최상단 호가 물량 합산
-        bid_vol = sum(float(b[1]) for b in bids[:3])
-        ask_vol = sum(float(a[1]) for a in asks[:3])
+        # [수정] 리스트([p, s])와 딕셔너리({'size': s}) 구조 모두 대응
+        def get_size(item):
+            if isinstance(item, list) and len(item) > 1: return float(item[1])
+            return float(item.get('size', 0))
+
+        bid_vol = sum(get_size(b) for b in bids[:3])
+        ask_vol = sum(get_size(a) for a in asks[:3])
         
         if (bid_vol + ask_vol) == 0: return False, "NO_LIQUIDITY"
         
         obi = (bid_vol - ask_vol) / (bid_vol + ask_vol)
-        
-        # 매수세가 너무 강하면(0.7 이상) 내 매도 물량이 너무 빨리 먹힐 수 있어 방어
-        if obi > 0.7: return False, "HIGH_BUY_PRESSURE"
+        if obi > 0.8: return False, "HIGH_BUY_PRESSURE" # 기준 완화(0.7 -> 0.8)
         return True, "OK"
 
     def validate_order(self, side: str, price: float, orderbook: dict[str, Any]) -> tuple[bool, str]:

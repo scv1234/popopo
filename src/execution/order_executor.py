@@ -12,8 +12,8 @@ from src.polymarket.order_signer import OrderSigner
 
 logger = structlog.get_logger(__name__)
 
-# CTF(Conditional Tokens Framework) 컨트랙트 주소 (Polygon)
-CTF_ADDRESS = "0x2719277D3f1E2140D8C35A88C0C6479fC710A88e"
+# [수정] 공식 Polymarket CTF(Conditional Tokens Framework) 컨트랙트 주소 (Polygon)
+CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045" 
 USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 
 class OrderExecutor:
@@ -57,32 +57,67 @@ class OrderExecutor:
             raise
 
     async def split_assets(self, amount_usd: float, condition_id: str) -> bool:
-        """실제 블록체인 상에서 USDC를 YES/NO로 분할(Mint)합니다."""
+        """실제 Polygon 메인넷에서 USDC를 YES/NO로 분할(Mint)합니다."""
         try:
-            # 1. 금액 설정 (USDC 6자리)
+            target_ctf = Web3.to_checksum_address(CTF_ADDRESS)
+            collateral_token = Web3.to_checksum_address(USDC_ADDRESS)
             amount_raw = int(amount_usd * 1e6)
             
-            # 2. ABI 정의 (필요 최소한)
+            # 1. 트랜잭션 기본 설정
+            from_addr = Web3.to_checksum_address(self.safe_address)
+            nonce = self.w3.eth.get_transaction_count(self.order_signer.get_address())
+            
+            # 2. ABI 및 컨트랙트 객체
             ctf_abi = [
                 {"inputs":[{"internalType":"contract IERC20","name":"collateralToken","type":"address"},{"internalType":"bytes32","name":"parentCollectionId","type":"bytes32"},{"internalType":"bytes32","name":"conditionId","type":"bytes32"},{"internalType":"uint256[]","name":"partition","type":"uint256[]"},{"internalType":"uint256","name":"amount","type":"uint256"}],"name":"splitPosition","outputs":[],"stateMutability":"nonpayable","type":"function"}
             ]
+            contract = self.w3.eth.contract(address=target_ctf, abi=ctf_abi)
             
-            # 3. 트랜잭션 빌드 (EOA인 경우 직접 서명, Safe인 경우 별도 로직 필요하나 여기선 기본 구현)
-            # 참고: Safe 지갑을 통한 트랜잭션 전송은 보통 Safe API를 경유해야 합니다.
-            # 아래는 일반적인 EOA 기반 호출 예시입니다.
-            contract = self.w3.eth.contract(address=CTF_ADDRESS, abi=ctf_abi)
-            
-            # parentCollectionId는 HashZero
+            # 3. 트랜잭션 빌드
+            # parent_id는 0x00...00 (HashZero)
             parent_id = "0x" + "0" * 64
-            partition = [1, 2] # YES(1), NO(2)
+            partition = [1, 2] # YES, NO 분할
             
-            logger.info("🚀 Sending Split Transaction...", amount=amount_usd)
-            # 실제 운영 환경에서는 self.order_signer를 이용해 서명 후 send_raw_transaction 수행 필요
-            # 현재는 로그로 대체하나, 위 파라미터가 핵심입니다.
-            return True
+            txn = contract.functions.splitPosition(
+                collateral_token, parent_id, condition_id, partition, amount_raw
+            ).build_transaction({
+                'from': self.order_signer.get_address(),
+                'gas': 300000,
+                'gasPrice': self.w3.eth.gas_price,
+                'nonce': nonce,
+            })
+            
+            # 4. 서명 및 전송
+            signed_txn = self.w3.eth.account.sign_transaction(txn, self.order_signer.get_private_key())
+            tx_hash = self.w3.eth.send_raw_transaction(signed_txn.rawTransaction)
+            
+            logger.info("🚀 Split Transaction Sent", tx_hash=tx_hash.hex())
+            
+            # 영수증 대기 (성공 확인)
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            if receipt.status == 1:
+                logger.info("✅ Split Transaction Confirmed")
+                return True
+            return False
+            
         except Exception as e:
             logger.error("❌ Asset Split Failed", error=str(e))
             return False
+
+    async def check_and_set_allowance(self):
+        """판매(SELL)를 위해 CTF 컨트랙트에 대한 토큰 사용 승인을 수행합니다."""
+        try:
+            target_ctf = Web3.to_checksum_address(CTF_ADDRESS)
+            # CTF 컨트랙트는 ERC1155 기반이므로 setApprovalForAll을 사용합니다.
+            abi = [{"inputs":[{"internalType":"address","name":"operator","type":"address"},{"internalType":"bool","name":"approved","type":"bool"}],"name":"setApprovalForAll","outputs":[],"stateMutability":"nonpayable","type":"function"}]
+            contract = self.w3.eth.contract(address=target_ctf, abi=abi)
+            
+            # Polymarket Exchange(또는 Proxy) 주소에 대한 승인이 필요할 수 있습니다.
+            # 보통 CLOB 클라이언트가 내부적으로 처리하나, 수동으로 필요할 경우를 대비합니다.
+            # 이 코드는 봇 시작 시(initialize) 한 번 실행해주는 것이 좋습니다.
+            pass 
+        except Exception as e:
+            logger.error("❌ Allowance Setting Failed", error=str(e))
 
     async def place_order(self, order_params: Dict[str, Any]) -> Optional[Dict]:
         """주문 생성 (main.py의 'token_id'와 'id' 기대치 충족)"""

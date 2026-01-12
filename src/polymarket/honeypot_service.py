@@ -225,21 +225,19 @@ class HoneypotService:
 
         effective_depth_usd = 0.0
 
-        # 3. 매수 호가(Bids) 합산
+        # [수정] 3. 매수 호가(Bids) 합산
         for bid in bids:
-            price = float(bid['price'])
-            if price >= lower_bound:
-                effective_depth_usd += (price * float(bid['size']))
-            else:
-                break # 범위를 벗어나면 즉시 중단 (성능 최적화)
+            p = float(bid[0] if isinstance(bid, list) else bid.get('price', 0))
+            s = float(bid[1] if isinstance(bid, list) else bid.get('size', 0))
+            if p >= lower_bound: effective_depth_usd += (p * s)
+            else: break
 
-        # 4. 매도 호가(Asks) 합산
+        # [수정] 4. 매도 호가(Asks) 합산
         for ask in asks:
-            price = float(ask['price'])
-            if price <= upper_bound:
-                effective_depth_usd += (price * float(ask['size']))
-            else:
-                break # 범위를 벗어나면 즉시 중단
+            p = float(ask[0] if isinstance(ask, list) else ask.get('price', 0))
+            s = float(ask[1] if isinstance(ask, list) else ask.get('size', 0))
+            if p <= upper_bound: effective_depth_usd += (p * s)
+            else: break
 
         return effective_depth_usd, mid_price
 
